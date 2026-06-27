@@ -14,7 +14,10 @@ use crate::Ruma;
 #[derive(Debug, Deserialize)]
 struct Claim {
 	/// Subject is the localpart of the User MXID
+	#[allow(dead_code)]
 	sub: String,
+	/// Custom claim containing the matrix username
+	username: Option<String>,
 }
 
 pub(super) async fn handle_login(
@@ -45,7 +48,11 @@ pub(crate) fn validate_user(services: &Services, token: &str) -> Result<OwnedUse
 	}
 
 	let claim = validate(config, token)?;
-	let local = claim.sub.to_lowercase();
+	let Some(username) = claim.username else {
+		return Err!(Request(InvalidUsername("JWT is missing the 'username' claim.")));
+	};
+
+	let local = username.to_lowercase();
 	let server = &services.server.name;
 	let user_id = UserId::parse_with_server_name(local, server).map_err(|e| {
 		err!(Request(InvalidUsername("JWT subject is not a valid user MXID: {e}")))
