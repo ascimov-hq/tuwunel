@@ -154,6 +154,7 @@ fn register_client_keys_and_backup_routes(router: Router<State>) -> Router<State
 fn register_client_room_routes(router: Router<State>) -> Router<State> {
 	router
 		.ruma_route(&client::appservice_ping)
+		.ruma_route(&client::delete_room_yeet_route)
 		.ruma_route(&client::set_read_marker_route)
 		.ruma_route(&client::create_receipt_route)
 		.ruma_route(&client::create_typing_event_route)
