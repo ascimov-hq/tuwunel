@@ -1062,3 +1062,8 @@ let_underscore_future = { level = "allow", priority = 1 }
 
 # rust doesnt understand tuwunel's custom log macros
 literal_string_with_formatting_args = { level = "allow", priority = 1 }
+
+
+# intbox custom changes
+[patch."https://github.com/matrix-construct/ruma"]
+ruma = { git = "https://github.com/ascimov-hq/ruma", rev = "e511bbd965aad8210b174ce02912b5de0e127557" }
