@@ -1,5 +1,5 @@
 use futures::{FutureExt, StreamExt, TryFutureExt};
-use ruma::{UserId, events::TimelineEventType};
+use ruma::{UserId, api::appservice::Registration, events::TimelineEventType};
 use tuwunel_core::{
 	Result, error, implement,
 	matrix::{
@@ -19,9 +19,11 @@ use super::RegistrationInfo;
 #[tracing::instrument(name = "append", level = "debug", skip_all)]
 pub(crate) async fn append_pdu(&self, pdu_id: RawPduId, pdu: &Pdu) -> Result {
 	let guard = self.read().await;
+	let skip_without_url = self.services.config.appservice_skip_without_url;
 
 	guard
 		.values()
+		.filter(|appservice| !skip_without_url || has_url(&appservice.registration))
 		.stream()
 		.for_each_concurrent(automatic_width(), |appservice| {
 			self.append_pdu_to(appservice, pdu_id, pdu)
@@ -59,6 +61,17 @@ async fn append_pdu_to(
 	}
 
 	Ok(())
+}
+
+/// Whether the registration has a URL to deliver transactions to. Without one
+/// (`url: null`, as used by double-puppeting registrations) the appservice
+/// receives nothing: `send_request` drops the transaction anyway, so queueing
+/// and serializing every PDU for it is wasted work.
+fn has_url(registration: &Registration) -> bool {
+	registration
+		.url
+		.as_deref()
+		.is_some_and(|url| !url.is_empty() && url != "null")
 }
 
 #[implement(super::Service)]

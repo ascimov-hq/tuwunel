@@ -165,14 +165,20 @@ impl Data {
 		since: u64,
 		to: Option<u64>,
 	) -> impl Stream<Item = (&UserId, u64, &[u8])> + Send + '_ {
+		// Keys are `count.to_be_bytes() ++ user_id` (see `presenceid_key`), so
+		// key order is count order: seek to the first count after `since` and
+		// stop past `to` instead of scanning the whole table on every sync.
+		let from = since.saturating_add(1).to_be_bytes();
+
 		self.presenceid_presence
-			.raw_stream()
+			.raw_stream_from(&from)
 			.ignore_err()
-			.ready_filter_map(move |(key, presence)| {
+			.ready_filter_map(|(key, presence)| {
 				let (count, user_id) = presenceid_parse(key).ok()?;
-				(count > since && to.is_none_or(|to| count <= to))
-					.then_some((user_id, count, presence))
+				Some((user_id, count, presence))
 			})
+			.ready_take_while(move |&(_, count, _)| to.is_none_or(|to| count <= to))
+			.ready_filter(move |&(_, count, _)| count > since)
 	}
 }
 

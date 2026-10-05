@@ -176,33 +176,49 @@ where
 		.set_forward_extremities(pdu.room_id(), leafs, state_lock)
 		.await;
 
+	// Senders in an exclusive appservice namespace (bridge ghosts and bots) never
+	// read rooms and are never push targets, so their read marker and
+	// notification counts are dead bookkeeping (several writes per event).
+	let track_sender_reads = !self
+		.services
+		.config
+		.appservice_skip_sender_read_markers
+		|| !self
+			.services
+			.appservice
+			.is_exclusive_user_id(pdu.sender())
+			.await;
+
 	let insert_lock = self.mutex_insert.lock(pdu.room_id()).await;
 	let next_count = self.services.globals.next_count();
 
 	// Mark as read first so the sending client doesn't get a notification even if
 	// appending fails. Route through the dispatcher so per-thread counts are
 	// also cleared; the sender's own send subsumes any thread receipt.
-	self.services
-		.read_receipt
-		.private_read_set(PrivateRead {
-			room_id: pdu.room_id(),
-			user_id: pdu.sender(),
-			count: *next_count,
-			ts: pdu.origin_server_ts(),
-			thread: &ReceiptThread::Unthreaded,
-			announce: false,
-		})
-		.await;
+	if track_sender_reads {
+		self.services
+			.read_receipt
+			.private_read_set(PrivateRead {
+				room_id: pdu.room_id(),
+				user_id: pdu.sender(),
+				count: *next_count,
+				ts: pdu.origin_server_ts(),
+				thread: &ReceiptThread::Unthreaded,
+				announce: false,
+			})
+			.await;
+	}
 
-	let notifications_cleared = self
-		.services
-		.pusher
-		.reset_notification_counts_for_thread(
-			pdu.sender(),
-			pdu.room_id(),
-			&ReceiptThread::Unthreaded,
-		)
-		.await;
+	let notifications_cleared = track_sender_reads
+		&& self
+			.services
+			.pusher
+			.reset_notification_counts_for_thread(
+				pdu.sender(),
+				pdu.room_id(),
+				&ReceiptThread::Unthreaded,
+			)
+			.await;
 
 	let count = PduCount::Normal(*next_count);
 	let pdu_id: RawPduId = PduId { shortroomid, count }.into();

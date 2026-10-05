@@ -24,7 +24,7 @@ use smallvec::SmallVec;
 
 pub use self::{
 	Count as PduCount, Id as PduId, Pdu as PduEvent, RawId as RawPduId,
-	builder::{Builder, Builder as PduBuilder},
+	builder::{Builder, Builder as PduBuilder, SUPPRESS_NOTIFICATIONS, notifications_suppressed},
 	count::Count,
 	format::{
 		check::{check_room_id, check_rules},

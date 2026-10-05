@@ -15,7 +15,7 @@ use tuwunel_core::{
 	Result, implement,
 	matrix::{
 		event::Event,
-		pdu::{Count, Pdu, PduId, RawPduId},
+		pdu::{Count, Pdu, PduId, RawPduId, notifications_suppressed},
 	},
 	utils::{BoolExt, ReadyExt, future::TryExtExt, option::OptionExt, time::now_millis},
 };
@@ -47,13 +47,31 @@ pub struct Notified {
 #[implement(super::Service)]
 #[tracing::instrument(name = "append", level = "debug", skip_all)]
 pub(crate) async fn append_pdu(&self, pdu_id: RawPduId, pdu: &Pdu) -> Result {
+	// Historical events appended without notifications (beeper batch send).
+	if notifications_suppressed() {
+		return Ok(());
+	}
+
+	// Users in an exclusive appservice namespace (bridge ghosts and bots) are
+	// never push-evaluated, as in Synapse. Exclude them before the per-member
+	// `is_active` lookup rather than relying on it to fail for them.
+	let skip_appservice_users = self.services.config.appservice_skip_push_targets;
+	let appservices = self.services.appservice.read().await;
+	let is_appservice_user = |user: &UserId| {
+		skip_appservice_users
+			&& appservices
+				.values()
+				.any(|info| info.is_exclusive_user_match(user))
+	};
+
 	// Don't notify the sender of their own events, and dont send from ignored users
 	let push_target = self
 		.services
 		.state_cache
-		.active_local_users_in_room(pdu.room_id())
+		.local_users_in_room(pdu.room_id())
+		.ready_filter(|user| *user != pdu.sender() && !is_appservice_user(user))
+		.filter(|user| self.services.users.is_active(user))
 		.map(ToOwned::to_owned)
-		.ready_filter(|user| *user != pdu.sender())
 		.filter_map(async |recipient_user| {
 			self.services
 				.users
@@ -74,6 +92,7 @@ pub(crate) async fn append_pdu(&self, pdu_id: RawPduId, pdu: &Pdu) -> Result {
 
 	if *pdu.kind() == TimelineEventType::RoomMember
 		&& let Some(Ok(target_user_id)) = pdu.state_key().map(UserId::parse)
+		&& !is_appservice_user(&target_user_id)
 		&& self
 			.services
 			.users
@@ -82,6 +101,8 @@ pub(crate) async fn append_pdu(&self, pdu_id: RawPduId, pdu: &Pdu) -> Result {
 	{
 		push_target.insert(target_user_id);
 	}
+
+	drop(appservices);
 
 	let serialized = pdu.to_format();
 	let thread_root = self.services.threads.get_thread_id(pdu).await;

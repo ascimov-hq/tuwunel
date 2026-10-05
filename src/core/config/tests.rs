@@ -379,6 +379,31 @@ default_power_level_content_override = false
 	assert!(err.contains("default_power_level_content_override"), "{err}");
 }
 
+#[test]
+fn appservice_key_proxy_defaults_to_no_registration() {
+	let config = config_from_toml("[global]\n").unwrap();
+
+	assert!(config.appservice_key_proxy.is_empty());
+	check(&config).expect("the default passes config check");
+}
+
+#[test]
+fn appservice_key_proxy_lists_registration_ids() {
+	let config = config_from_toml(
+		r#"[global]
+appservice_key_proxy = ["e2ee_bridge", "other"]
+"#,
+	)
+	.unwrap();
+
+	let expected: BTreeSet<String> = ["e2ee_bridge", "other"]
+		.into_iter()
+		.map(ToOwned::to_owned)
+		.collect();
+
+	assert_eq!(config.appservice_key_proxy, expected);
+}
+
 /// A documented default is published to operators through the generated
 /// tuwunel-example.toml, so one that disagrees with the code hands out a value
 /// the server never uses. Only integer defaults are compared; prose such as

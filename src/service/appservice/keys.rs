@@ -23,6 +23,9 @@ type ClaimedKeys = BTreeMap<OwnedDeviceId, BTreeMap<OwnedOneTimeKeyId, Raw<OneTi
 type QueriedKeys = BTreeMap<OwnedDeviceId, Raw<DeviceKeys>>;
 type Registrations = SmallVec<[Registration; 1]>;
 
+/// MSC3983: claims one-time keys for `user_id` from the appservices that opted
+/// in through `appservice_key_proxy`. When none did (the default), no
+/// appservice is asked and the result is empty.
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self, one_time_keys))]
 pub async fn claim_keys(
@@ -30,7 +33,7 @@ pub async fn claim_keys(
 	user_id: &UserId,
 	one_time_keys: &BTreeMap<OwnedDeviceId, OneTimeKeyAlgorithm>,
 ) -> ClaimedKeys {
-	self.registrations_for_user(user_id)
+	self.key_proxy_registrations(user_id)
 		.await
 		.into_iter()
 		.stream()
@@ -44,7 +47,7 @@ pub async fn claim_keys(
 				one_time_keys: [(user_id.to_owned(), devices)].into(),
 			};
 
-			self.send_request(registration, request)
+			self.send_optional_request(registration, request)
 				.await
 				.ok()
 				.flatten()
@@ -74,10 +77,13 @@ pub async fn claim_keys(
 		.await
 }
 
+/// MSC3984: queries device keys of `user_id` from the appservices that opted
+/// in through `appservice_key_proxy`. When none did (the default), no
+/// appservice is asked and the result is empty.
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip(self, devices))]
 pub async fn query_keys(&self, user_id: &UserId, devices: &[OwnedDeviceId]) -> QueriedKeys {
-	self.registrations_for_user(user_id)
+	self.key_proxy_registrations(user_id)
 		.await
 		.into_iter()
 		.stream()
@@ -86,7 +92,7 @@ pub async fn query_keys(&self, user_id: &UserId, devices: &[OwnedDeviceId]) -> Q
 				device_keys: [(user_id.to_owned(), devices.to_vec())].into(),
 			};
 
-			self.send_request(registration, request)
+			self.send_optional_request(registration, request)
 				.await
 				.ok()
 				.flatten()
@@ -99,12 +105,30 @@ pub async fn query_keys(&self, user_id: &UserId, devices: &[OwnedDeviceId]) -> Q
 		.await
 }
 
+/// The registrations a key claim or key query for `user_id` goes to: those
+/// listed in `appservice_key_proxy` that claim `user_id` exclusively (or whose
+/// sender it is). With the default empty list this returns at once, without
+/// taking the registrations lock or cloning any registration.
 #[implement(super::Service)]
-async fn registrations_for_user(&self, user_id: &UserId) -> Registrations {
-	self.read()
-		.await
+async fn key_proxy_registrations(&self, user_id: &UserId) -> Registrations {
+	if self
+		.services
+		.config
+		.appservice_key_proxy
+		.is_empty()
+	{
+		return Registrations::new();
+	}
+
+	let registrations = self.read().await;
+
+	// Read the config only after the await: references into it must not be
+	// held across one (see tuwunel_core::config::Manager).
+	let opted_in = &self.services.config.appservice_key_proxy;
+
+	registrations
 		.values()
-		.filter(|info| info.is_user_match(user_id))
+		.filter(|info| info.is_key_proxy_match(opted_in, user_id))
 		.map(|info| info.registration.clone())
 		.collect()
 }

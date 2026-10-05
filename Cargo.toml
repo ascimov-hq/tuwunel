@@ -685,6 +685,7 @@ default-features = false
 package = "tuwunel_api"
 path = "src/api"
 default-features = false
+features = ["server"]
 
 [workspace.dependencies.tuwunel-service]
 package = "tuwunel_service"

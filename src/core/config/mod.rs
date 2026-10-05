@@ -320,6 +320,75 @@ pub struct Config {
 	#[serde(default = "default_client_sync_timeout_max")]
 	pub client_sync_timeout_max: u64,
 
+	/// After a long-polling legacy /sync is woken by activity, wait this many
+	/// milliseconds (never past the request's timeout) before rebuilding the
+	/// response, so a burst of writes across many rooms (e.g. a bridge import)
+	/// produces one rebuild instead of one per wakeup. 0 disables the wait.
+	///
+	/// reloadable: yes
+	/// default: 0
+	#[serde(default)]
+	pub sync_wake_debounce_ms: u64,
+
+	/// Leave joined rooms out of incremental legacy /sync responses when they
+	/// carry nothing the client's filter asked for: no timeline events, state,
+	/// ephemeral events or account data. Without this a room is still sent for
+	/// e.g. the unchanged unread counts of a room the user never read, or a
+	/// `limited` flag on a timeline the filter excludes entirely, which keeps
+	/// long-polls (such as a bridge bot filtering `not_types: ["*"]`) from
+	/// waiting. Newly joined rooms, initial and full-state syncs, and rooms
+	/// whose read position moved are always sent. A change seen only in the
+	/// room summary (member counts) or in notification counts raised by events
+	/// the filter excludes is not sent on its own; it arrives with the room's
+	/// next reported change.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub sync_omit_empty_rooms: bool,
+
+	/// Honour `lazy_load_members` in encrypted rooms on legacy /sync. By default
+	/// it is ignored there because device-list changes were derived from the
+	/// lazily trimmed member state; with this enabled they are derived from
+	/// the untrimmed member changes instead. Clients that opt in must load the
+	/// member list (e.g. /members) before encrypting to a room. Clients that do
+	/// not request lazy loading are unaffected.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub lazy_load_encrypted_rooms: bool,
+
+	/// Treat the `to` token of /messages as an exclusive bound which stops
+	/// pagination at the first event at or beyond it. By default pagination
+	/// stops only on an event whose position equals `to` exactly, so a `to`
+	/// taken from /sync (a global position) often walks past the gap it was
+	/// meant to fill. Enable only once clients no longer depend on the old
+	/// behaviour.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub messages_clamp_to_token: bool,
+
+	/// Enable the Beeper batch-send endpoint for appservices
+	/// (`POST /_matrix/client/unstable/com.beeper.backfill/rooms/{roomId}/batch_send`)
+	/// and advertise `com.beeper.batch_sending` in /versions. Only forward
+	/// batches are supported: events are appended at the end of the room in
+	/// the given order and the server-assigned event IDs are returned in the
+	/// same order. Senders must be joined to the room and be in the calling
+	/// appservice's namespace or, for double puppeting, be local users covered
+	/// by a URL-less appservice registration (whose token bridges hold) and
+	/// not claimed exclusively by any appservice; `mark_read_by` follows the
+	/// same rule. The room must belong to the calling appservice: its bot is
+	/// joined, or the bot or a user in its exclusive namespace created the
+	/// room.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub beeper_batch_send: bool,
+
 	/// Custom DNS servers to query instead of the operating system's default
 	/// resolvers; when this list is non-empty, `/etc/resolv.conf` is never
 	/// read. Each entry is an IP address with an optional port, defaulting to
@@ -696,6 +765,84 @@ pub struct Config {
 	/// default: 300
 	#[serde(default = "default_appservice_idle_timeout")]
 	pub appservice_idle_timeout: u64,
+
+	/// Leave users in an exclusive appservice user namespace (and appservice
+	/// senders) out of push-rule evaluation for room events, as Synapse does.
+	/// They were already skipped because they have no password, but only after
+	/// one database lookup per room member per event.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub appservice_skip_push_targets: bool,
+
+	/// Do not record a private read marker or reset notification counts for
+	/// the sender of each event when the sender is in an exclusive appservice
+	/// user namespace (bridge ghosts and bots): they never read rooms and are
+	/// never push targets, so this bookkeeping is several dead writes per
+	/// bridged event.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub appservice_skip_sender_read_markers: bool,
+
+	/// Do not store the default push-rules account data for users registered
+	/// by an appservice. Readers fall back to the server-default ruleset and
+	/// GET /pushrules recreates the event on demand; storing it costs ~4 KB of
+	/// disk per bridge ghost.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub appservice_skip_default_push_rules: bool,
+
+	/// Do not queue room events for appservice registrations without a URL
+	/// (`url: null` or empty, e.g. double-puppeting registrations). Such
+	/// appservices never receive transactions; the queued events were only
+	/// serialized and then dropped.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub appservice_skip_without_url: bool,
+
+	/// Registration IDs of the appservices that serve the unstable MSC3983
+	/// (one-time key claims) and MSC3984 (device key queries) routes. Key
+	/// claims and key queries for a user in one of these appservices'
+	/// exclusive user namespaces, or for its sender, are forwarded to that
+	/// appservice. No other appservice is asked.
+	///
+	/// The default (empty) forwards nothing. Synapse behaves the same with its
+	/// experimental `msc3983_appservice_otk_claims` and
+	/// `msc3984_appservice_key_query` flags off (their default), and upstream
+	/// Tuwunel removed the forwarding in 1.9.2. List only appservices that
+	/// implement these routes; mautrix bridges do not. Without this gate,
+	/// a /keys/query naming N users of a bridge's namespace sent N requests
+	/// to the bridge, each answered with 404.
+	///
+	/// A 404, 405 or M_UNRECOGNIZED answer from these routes is logged at
+	/// debug level, not as a warning.
+	///
+	/// reloadable: yes
+	/// default: []
+	#[serde(default)]
+	pub appservice_key_proxy: BTreeSet<String>,
+
+	/// Maintain a room's joined/invited/knocked member counters incrementally
+	/// on each membership change (point lookups and +-1) instead of
+	/// recounting every member of the room on every member event. Full
+	/// recounts still happen on joins over federation, state resets and
+	/// migrations.
+	///
+	/// This removes O(members) work per member event (O(N^2) to fill a large
+	/// bridged group), but counters could drift if membership ever changes
+	/// outside the normal update path; disable to return to full recounts.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub incremental_joined_count: bool,
 
 	/// Notification gateway pusher idle connection pool timeout.
 	///

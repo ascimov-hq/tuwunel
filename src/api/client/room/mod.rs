@@ -5,6 +5,7 @@ mod initial_sync;
 mod summary;
 mod timestamp;
 mod upgrade;
+mod yeet;
 
 pub(crate) use self::{
 	aliases::get_room_aliases_route,
@@ -14,4 +15,5 @@ pub(crate) use self::{
 	summary::{get_room_summary, get_room_summary_legacy},
 	timestamp::get_event_by_timestamp_route,
 	upgrade::upgrade_room_route,
+	yeet::delete_room_yeet_route,
 };

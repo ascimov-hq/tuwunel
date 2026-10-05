@@ -18,6 +18,9 @@ crate-type = [
 ]
 
 [features]
+default = [
+	"server",
+]
 brotli_compression = [
 	"reqwest/brotli",
 	"tuwunel-core/brotli_compression",
@@ -72,6 +75,12 @@ zstd_compression = [
 	"tuwunel-core/zstd_compression",
 	"tuwunel-service/zstd_compression",
 ]
+
+# Required by ruma's `#[request]`/`#[response]` macros for the endpoint types
+# this crate defines itself (e.g. Beeper room yeeting): `server` enables the
+# generated `IncomingRequest`/`OutgoingResponse` impls; `client` is never used.
+client = []
+server = []
 
 [dependencies]
 axum-extra.workspace = true

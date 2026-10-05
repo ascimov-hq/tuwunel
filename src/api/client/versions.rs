@@ -43,6 +43,12 @@ pub(crate) async fn get_supported_versions_route(
 					.rendezvous_enabled
 					.then_some("org.matrix.msc4108"),
 			)
+			.chain(
+				services
+					.config
+					.beeper_batch_send
+					.then_some("com.beeper.batch_sending"),
+			)
 			.map(Into::into)
 			.zip(once(true).cycle())
 			.collect(),
@@ -81,7 +87,7 @@ static VERSIONS: [&str; 27] = [
 	"v1.19",  /* mutual rooms (MSC2666) */
 ];
 
-static UNSTABLE_FEATURES: [&str; 38] = [
+static UNSTABLE_FEATURES: [&str; 39] = [
 	"org.matrix.e2e_cross_signing",
 	// private read receipts (https://github.com/matrix-org/matrix-spec-proposals/pull/2285)
 	"org.matrix.msc2285.stable",
@@ -153,4 +159,6 @@ static UNSTABLE_FEATURES: [&str; 38] = [
 	"org.matrix.msc3440.stable",
 	// state_after on /sync (https://github.com/matrix-org/matrix-spec-proposals/pull/4222)
 	"org.matrix.msc4222",
+	// Beeper room yeeting: full room purge on delete (POST .../com.beeper.yeet/rooms/{roomId}/delete)
+	"com.beeper.room_yeeting",
 ];

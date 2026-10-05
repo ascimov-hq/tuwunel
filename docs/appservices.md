@@ -116,6 +116,7 @@ These options go in the top-level `[global]` section:
 | `appservice_timeout` | `35` | Request timeout in seconds when pushing events to an appservice. |
 | `appservice_idle_timeout` | `300` | Idle connection pool timeout in seconds. |
 | `dns_passthru_appservices` | `false` | Bypass DNS passthru domain matching for all appservice URLs. More efficient than listing each domain in `dns_passthru_domains` when all appservices share the same network. |
+| `appservice_key_proxy` | `[]` | Registration IDs of the appservices that serve the unstable one-time key claim ([MSC3983](https://github.com/matrix-org/matrix-spec-proposals/pull/3983)) and device key query ([MSC3984](https://github.com/matrix-org/matrix-spec-proposals/pull/3984)) routes. Claims and queries for those appservices' exclusive users (and senders) are forwarded to them; the default forwards nothing. A 404, 405 or `M_UNRECOGNIZED` answer is logged at debug level. Reloadable. |
 
 ## Getting help
 

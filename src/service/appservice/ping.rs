@@ -10,7 +10,7 @@ use tuwunel_core::{
 	Error, Result, err, http::StatusCode, implement, utils::string_from_bytes, warn,
 };
 
-use super::request::add_access_token_query;
+use super::request::{add_access_token_query, redact_error_url};
 use crate::client::read_response_capped;
 
 /// Pings an appservice per MSC2659, surfacing the spec's failure error codes.
@@ -54,6 +54,8 @@ pub async fn ping(
 		.execute(reqwest_request)
 		.await
 		.map_err(|e| {
+			// The error's URL carries the hs_token as `?access_token=`.
+			let e = redact_error_url(e);
 			if e.is_timeout() {
 				err!(Request(ConnectionTimeout(warn!(
 					appservice = %registration.id,

@@ -185,8 +185,21 @@ pub(crate) async fn get_messages(
 
 	let shortroomid = services.short.get_shortroomid(room_id).await?;
 
+	// `to` is an exclusive bound. Without `messages_clamp_to_token` paging stops
+	// only on an event whose count equals `to` exactly, so a token that falls
+	// between this room's events (sync tokens are global) walks past the gap.
+	// The clamp stops at the first event at or beyond `to` instead. (upstream
+	// 7cbcbe5e5, v1.9.3)
+	let clamp_to = services.config.messages_clamp_to_token;
+	let reached_to = |count: PduCount| match (to, dir) {
+		| (None, _) => false,
+		| (Some(to), _) if !clamp_to => count == to,
+		| (Some(to), Direction::Forward) => count >= to,
+		| (Some(to), Direction::Backward) => count <= to,
+	};
+
 	let events: Vec<_> = it
-		.ready_take_while(|(count, _)| Some(*count) != to)
+		.ready_take_while(|(count, _)| !reached_to(*count))
 		.ready_filter_map(|item| event_filter(item, filter))
 		.wide_filter_map(|item| related_by_filter(services, shortroomid, filter, item))
 		.wide_filter_map(|item| event_filters(services, sender_user, item, bypass_visibility))

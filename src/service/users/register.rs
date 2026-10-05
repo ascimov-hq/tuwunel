@@ -80,22 +80,32 @@ pub async fn full_register(
 		.set_displayname(user_id, Some(displayname), Some(Propagation::None))
 		.await?;
 
-	// Initial account data
-	self.services
-		.account_data
-		.update(
-			None,
-			user_id,
-			GlobalAccountDataEventType::PushRules
-				.to_string()
-				.into(),
-			&serde_json::to_value(ruma::events::push_rules::PushRulesEvent {
-				content: ruma::events::push_rules::PushRulesEventContent {
-					global: push::Ruleset::server_default(user_id),
-				},
-			})?,
-		)
-		.await?;
+	// Initial account data. Appservice users (bridge ghosts) are never
+	// push-evaluated; readers fall back to the server-default ruleset when the
+	// event is missing (and GET /pushrules recreates it on demand), so storing
+	// a copy per ghost only costs disk and compaction.
+	if !(is_appservice
+		&& self
+			.services
+			.config
+			.appservice_skip_default_push_rules)
+	{
+		self.services
+			.account_data
+			.update(
+				None,
+				user_id,
+				GlobalAccountDataEventType::PushRules
+					.to_string()
+					.into(),
+				&serde_json::to_value(ruma::events::push_rules::PushRulesEvent {
+					content: ruma::events::push_rules::PushRulesEventContent {
+						global: push::Ruleset::server_default(user_id),
+					},
+				})?,
+			)
+			.await?;
+	}
 
 	// If this is the first real user, grant them admin privileges except for guest
 	// users

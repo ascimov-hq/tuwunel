@@ -18,7 +18,7 @@ use serde::Deserialize;
 use serde_json::{Value as JsonValue, value::RawValue as RawJsonValue};
 
 pub use self::{
-	filter::{Matches, trim_event_fields},
+	filter::{Matches, MatchesType, trim_event_fields},
 	format::{Owned, Ref},
 	id::*,
 	relation::RelationTypeEqual,

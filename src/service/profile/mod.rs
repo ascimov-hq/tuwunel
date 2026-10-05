@@ -4,14 +4,17 @@ use futures::{Stream, StreamExt, future::join};
 use ruma::{
 	MxcUri, OwnedMxcUri, OwnedRoomId, RoomId, UserId,
 	api::federation::query::get_profile_information,
-	events::room::member::{MembershipState, RoomMemberEventContent},
+	events::{
+		StateEventType, TimelineEventType,
+		room::member::{MembershipState, RoomMemberEventContent},
+	},
 	profile::{ProfileFieldName, ProfileFieldValue},
 };
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Map as JsonMap, Value, value::to_raw_value};
 use tuwunel_core::{
 	Err, Result, err, extract_variant, implement,
-	matrix::PduBuilder,
+	matrix::{Event, PduBuilder},
 	utils::{
 		TryReadyExt,
 		future::TryExtExt,
@@ -134,11 +137,13 @@ async fn update_room(
 		| Propagation::None => return Ok(()),
 	};
 
-	let mut content = self
+	let member = self
 		.services
 		.state_accessor
-		.get_member(room_id, user_id)
+		.room_state_get(room_id, &StateEventType::RoomMember, user_id.as_str())
 		.await?;
+
+	let mut content: RoomMemberEventContent = member.get_content()?;
 
 	if !matches!(content.membership, MembershipState::Join) {
 		return Ok(());
@@ -184,12 +189,22 @@ async fn update_room(
 
 	content.reason = None;
 
+	// Re-send the previous member content with only the profile fields changed;
+	// keys `RoomMemberEventContent` does not model (e.g. the bridge's
+	// `com.zeldin.bridge_ids`) would otherwise be dropped on every rename.
+	let content = with_unmodelled_member_fields(&content, member.get_content()?)?;
+
 	let state_lock = self.services.state.mutex.lock(room_id).await;
 
 	self.services
 		.timeline
 		.build_and_append_pdu(
-			PduBuilder::state(user_id.as_str(), &content),
+			PduBuilder {
+				event_type: TimelineEventType::RoomMember,
+				content: to_raw_value(&content)?.into(),
+				state_key: Some(user_id.as_str().into()),
+				..Default::default()
+			},
 			user_id,
 			room_id,
 			&state_lock,
@@ -197,6 +212,26 @@ async fn update_room(
 		.await?;
 
 	Ok(())
+}
+
+/// Serializes the updated member `content` and carries over every key of the
+/// `previous` content that the typed struct dropped, except the fields a
+/// profile update deliberately sets or clears.
+fn with_unmodelled_member_fields(
+	content: &RoomMemberEventContent,
+	previous: JsonMap<String, Value>,
+) -> Result<JsonMap<String, Value>> {
+	let Value::Object(mut merged) = serde_json::to_value(content)? else {
+		return Err!("m.room.member content did not serialize to an object");
+	};
+
+	for (key, value) in previous {
+		if !matches!(key.as_str(), "displayname" | "avatar_url" | "reason") {
+			merged.entry(key).or_insert(value);
+		}
+	}
+
+	Ok(merged)
 }
 
 /// Sets a new displayname or removes it if displayname is None. You still
