@@ -10,6 +10,7 @@ use tracing::{level_filters::LevelFilter, subscriber::set_global_default};
 use tracing_subscriber::fmt::{MakeWriter, fmt};
 
 use super::*;
+use crate::utils::BoolExt;
 
 thread_local! {
 	static CAPTURE: RefCell<Option<Arc<Mutex<Vec<u8>>>>> = const { RefCell::new(None) };
@@ -190,6 +191,50 @@ ip_source = "cf_connecting_ip"
 }
 
 #[test]
+fn check_warns_when_mas_provisioning_provider_is_untrusted() {
+	let untrusted_provisioning = r#"[global]
+mas_secret = "provisioning-secret"
+
+[[global.identity_provider]]
+brand = "MAS"
+client_id = "mas"
+client_secret = "oauth-secret"
+"#;
+
+	let trusted_provisioning = r#"[global]
+mas_secret = "provisioning-secret"
+
+[[global.identity_provider]]
+brand = "MAS"
+client_id = "mas"
+client_secret = "oauth-secret"
+trusted = true
+"#;
+
+	let untrusted_login = r#"[global]
+
+[[global.identity_provider]]
+brand = "MAS"
+client_id = "mas"
+client_secret = "oauth-secret"
+"#;
+
+	let cases = [
+		("untrusted provisioning provider", untrusted_provisioning, true),
+		("trusted provisioning provider", trusted_provisioning, false),
+		("untrusted login-only provider", untrusted_login, false),
+	];
+
+	for (name, toml, warns) in cases {
+		let config = config_from_toml(toml).expect("MAS provider config should parse");
+		let (result, logs) = check_with_captured_logs(&config);
+
+		result.expect("MAS provider config should pass config check");
+		assert_eq!(logs.contains("configured without `trusted = true`"), warns, "{name}");
+	}
+}
+
+#[test]
 fn reload_rejects_none_to_some_and_some_to_none() {
 	let none = config_from_toml("[global]\n").unwrap();
 	let some = config_from_toml(
@@ -303,4 +348,175 @@ fn pgp_key_rejects_raw_material_and_bare_fingerprints() {
 
 	let err = check_support_pgp_key("openpgp4fpr:nothex").unwrap_err();
 	assert!(err.to_string().contains("hex fingerprint"), "{err}");
+}
+
+#[test]
+fn default_power_level_content_override_accepts_a_table() {
+	let config = config_from_toml(
+		"[global]
+[global.default_power_level_content_override]
+users_default = 50
+",
+	)
+	.expect("a table value parses");
+
+	check(&config)
+		.expect("a table default_power_level_content_override should pass config check");
+}
+
+#[test]
+fn default_power_level_content_override_rejects_a_non_table() {
+	let config = config_from_toml(
+		"[global]
+default_power_level_content_override = false
+",
+	)
+	.expect("a scalar value parses into config");
+
+	let err = check(&config)
+		.expect_err("a non-table default_power_level_content_override must be rejected")
+		.to_string();
+	assert!(err.contains("default_power_level_content_override"), "{err}");
+}
+
+#[test]
+fn appservice_key_proxy_defaults_to_no_registration() {
+	let config = config_from_toml("[global]\n").unwrap();
+
+	assert!(config.appservice_key_proxy.is_empty());
+	check(&config).expect("the default passes config check");
+}
+
+#[test]
+fn appservice_key_proxy_lists_registration_ids() {
+	let config = config_from_toml(
+		r#"[global]
+appservice_key_proxy = ["e2ee_bridge", "other"]
+"#,
+	)
+	.unwrap();
+
+	let expected: BTreeSet<String> = ["e2ee_bridge", "other"]
+		.into_iter()
+		.map(ToOwned::to_owned)
+		.collect();
+
+	assert_eq!(config.appservice_key_proxy, expected);
+}
+
+/// A documented default is published to operators through the generated
+/// tuwunel-example.toml, so one that disagrees with the code hands out a value
+/// the server never uses. Only integer defaults are compared; prose such as
+/// "varies by system" and non-literal bodies are out of reach here.
+#[test]
+fn documented_defaults_match_the_code() {
+	const SRC: &str = include_str!("mod.rs");
+	const SERDE_DEFAULT: &str = "#[serde(default = \"";
+
+	let lines: Vec<&str> = SRC.lines().collect();
+	let bodies: BTreeMap<&str, &str> = lines
+		.iter()
+		.copied()
+		.filter_map(default_fn_body)
+		.collect();
+
+	let compared: Vec<(&str, u64, u64)> = lines
+		.iter()
+		.enumerate()
+		.filter_map(|(at, line)| {
+			let name = line
+				.trim()
+				.strip_prefix(SERDE_DEFAULT)?
+				.split('"')
+				.next()?;
+
+			let documented = documented_default(&lines, at)?;
+			let actual = bodies.get(name).copied().and_then(eval_int)?;
+
+			Some((name, documented, actual))
+		})
+		.collect();
+
+	let mismatched: Vec<String> = compared
+		.iter()
+		.filter(|(_, documented, actual)| documented != actual)
+		.map(|(name, documented, actual)| {
+			format!("{name}: documented {documented}, code returns {actual}")
+		})
+		.collect();
+
+	assert!(
+		mismatched.is_empty(),
+		"documented defaults disagree with the code:\n  {}",
+		mismatched.join("\n  ")
+	);
+
+	assert!(
+		compared.len() >= 70,
+		"only {} integer defaults were compared; the source parsing above has stopped matching \
+		 and this test is no longer checking anything",
+		compared.len()
+	);
+}
+
+/// A one-line `fn default_x() -> T { body }`, as (`default_x`, `body`).
+fn default_fn_body(line: &str) -> Option<(&str, &str)> {
+	let rest = line.trim().strip_prefix("fn ")?;
+	let (name, rest) = rest.split_once("()")?;
+	let body = rest.split_once('{')?.1.rsplit_once('}')?.0;
+
+	name.starts_with("default_")
+		.then_some((name, body.trim()))
+}
+
+/// The nearest `/// default: N` in the doc comment above `at`.
+fn documented_default(lines: &[&str], at: usize) -> Option<u64> {
+	lines[..at]
+		.iter()
+		.rev()
+		.take_while(|line| {
+			let line = line.trim();
+			line.starts_with("///") || line.starts_with("#[")
+		})
+		.find_map(|line| line.trim().strip_prefix("/// default: "))
+		.and_then(leading_int)
+}
+
+/// The leading integer, ignoring any trailing prose such as "86400 (24 hours)".
+fn leading_int(text: &str) -> Option<u64> {
+	let end = text
+		.find(|c: char| !c.is_ascii_digit())
+		.unwrap_or(text.len());
+
+	text.split_at(end).0.parse().ok()
+}
+
+/// Integer literals joined by `+` and `*`; a call, float or bool yields None.
+fn eval_int(body: &str) -> Option<u64> {
+	body.split('+')
+		.map(|term| {
+			term.split('*')
+				.map(int_literal)
+				.try_fold(1_u64, |acc, factor| acc.checked_mul(factor?))
+		})
+		.try_fold(0_u64, |acc, term| acc.checked_add(term?))
+}
+
+/// `1024_u16`, `60`, `10_000`; anything else yields None.
+fn int_literal(token: &str) -> Option<u64> {
+	const INT_SUFFIX: [&str; 11] =
+		["", "u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize"];
+
+	let token = token.trim();
+	let digits: String = token
+		.chars()
+		.take_while(|c| c.is_ascii_digit() || *c == '_')
+		.filter(char::is_ascii_digit)
+		.collect();
+
+	let suffix = token.trim_start_matches(|c: char| c.is_ascii_digit() || c == '_');
+
+	INT_SUFFIX
+		.contains(&suffix)
+		.and_then(|| digits.parse().ok())
 }

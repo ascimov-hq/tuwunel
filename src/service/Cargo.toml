@@ -19,8 +19,8 @@ crate-type = [
 
 [features]
 brotli_compression = [
-	"tuwunel-core/brotli_compression",
 	"reqwest/brotli",
+	"tuwunel-core/brotli_compression",
 ]
 bzip2_compression = [
     "tuwunel-database/bzip2_compression",
@@ -31,8 +31,8 @@ console = [
 ]
 element_hacks = []
 gzip_compression = [
-	"tuwunel-core/gzip_compression",
 	"reqwest/gzip",
+	"tuwunel-core/gzip_compression",
 ]
 io_uring = [
 	"tuwunel-database/io_uring",
@@ -63,21 +63,24 @@ media_thumbnail = [
 	"dep:image",
 ]
 release_max_log_level = [
-	"tuwunel-core/release_max_log_level",
-	"tuwunel-database/release_max_log_level",
 	"log/max_level_trace",
 	"log/release_max_level_info",
 	"tracing/max_level_trace",
 	"tracing/release_max_level_info",
+	"tuwunel-core/release_max_log_level",
+	"tuwunel-database/release_max_log_level",
+]
+systemd = [
+	"dep:sd-notify",
 ]
 url_preview = [
 	"dep:image",
 	"dep:webpage",
 ]
 zstd_compression = [
+	"reqwest/zstd",
 	"tuwunel-core/zstd_compression",
 	"tuwunel-database/zstd_compression",
-    "reqwest/zstd",
 ]
 
 [dependencies]
@@ -113,6 +116,7 @@ rustyline-async.optional = true
 serde_html_form.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
 subtle.workspace = true
@@ -128,10 +132,28 @@ webpki-root-certs.workspace = true
 tuwunel-core.workspace = true
 tuwunel-database.workspace = true
 
+# killpg, for reaping a video thumbnail program's process group
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(all(unix, target_os = "linux"))'.dependencies]
+sd-notify.workspace = true
+sd-notify.optional = true
+
+# rustls-platform-verifier neither builds (no new_with_extra_roots) nor runs (needs a JVM) on android
+[target.'cfg(not(target_os = "android"))'.dependencies.lettre]
+workspace = true
+features = ["rustls-platform-verifier"]
+
+[target.'cfg(target_os = "android")'.dependencies.lettre]
+workspace = true
+features = ["webpki-roots"]
+
 [dev-dependencies]
 criterion.workspace = true
 insta.workspace = true
 maplit.workspace = true
+minicbor-serde.workspace = true
 similar.workspace = true
 tracing-subscriber.workspace = true
 

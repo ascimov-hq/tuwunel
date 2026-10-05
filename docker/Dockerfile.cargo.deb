@@ -13,16 +13,25 @@ ARG cargo_features
 ARG cargo_spec_features
 ARG pkg_dir
 ARG deb_args=""
+ARG sched_policy="--rr"
+ARG sched_prio=1
 
 WORKDIR /usr/src/tuwunel
+ENV sched_policy=${sched_policy}
+ENV sched_prio=${sched_prio}
+# The packaging inputs (maintainer scripts, docs) live outside the compile
+# subset carried by the input layer, so mount them from the full source.
 RUN \
 --mount=type=cache,dst=${RUSTUP_HOME}/downloads,sharing=shared \
 --mount=type=cache,dst=${CARGO_HOME}/registry,sharing=shared \
 --mount=type=cache,dst=${CARGO_HOME}/git,sharing=shared \
+--mount=type=bind,from=source,source=/usr/src/tuwunel/debian,target=/usr/src/tuwunel/debian \
+--mount=type=bind,from=source,source=/usr/src/tuwunel/README.md,target=/usr/src/tuwunel/README.md \
+--mount=type=bind,from=source,source=/usr/src/tuwunel/LICENSE,target=/usr/src/tuwunel/LICENSE \
 <<EOF
     set -eux
     mkdir -p "${pkg_dir}"
-    rustup run ${rust_toolchain} \
+    rustup run ${rust_toolchain} sched_wrap.sh \
         cargo deb \
             --verbose \
             --locked \

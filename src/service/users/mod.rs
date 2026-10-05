@@ -2,14 +2,13 @@ mod dehydrated_device;
 pub mod device;
 mod keys;
 mod ldap;
-mod profile;
 mod register;
 
 use std::sync::Arc;
 
 use futures::{Stream, StreamExt, TryFutureExt};
 use ruma::{
-	MilliSecondsSinceUnixEpoch, OwnedRoomId, OwnedUserId, UserId,
+	MilliSecondsSinceUnixEpoch, OwnedUserId, UserId,
 	api::client::filter::FilterDefinition,
 	events::{
 		GlobalAccountDataEventType,
@@ -20,21 +19,13 @@ use ruma::{
 use serde::{Deserialize, Serialize};
 use tuwunel_core::{
 	Err, Result, debug_warn, err, is_equal_to,
-	pdu::PduBuilder,
+	matrix::pdu::PduCount,
 	trace,
-	utils::{
-		self, ReadyExt,
-		stream::{TryIgnore, automatic_width},
-	},
-	warn,
+	utils::{self, ReadyExt, stream::TryIgnore},
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
-pub use self::{
-	keys::parse_master_key,
-	profile::{Propagation, propagation_default},
-	register::Register,
-};
+pub use self::{dehydrated_device::DehydratedDevice, keys::parse_master_key, register::Register};
 
 pub const PASSWORD_SENTINEL: &str = "*";
 pub const PASSWORD_DISABLED: &str = "";
@@ -71,11 +62,9 @@ struct Data {
 	oidcdevice_userdeviceid: Arc<Map>,
 	oidccskeybypass_userid: Arc<Map>,
 	userfilterid_filter: Arc<Map>,
-	userid_avatarurl: Arc<Map>,
-	userid_blurhash: Arc<Map>,
 	userid_dehydrateddevice: Arc<Map>,
 	userid_devicelistversion: Arc<Map>,
-	userid_displayname: Arc<Map>,
+	userid_erased: Arc<Map>,
 	userid_lastonetimekeyupdate: Arc<Map>,
 	userid_locked: Arc<Map>,
 	userid_masterkeyid: Arc<Map>,
@@ -84,7 +73,6 @@ struct Data {
 	userid_selfsigningkeyid: Arc<Map>,
 	userid_suspended: Arc<Map>,
 	userid_usersigningkeyid: Arc<Map>,
-	useridprofilekey_value: Arc<Map>,
 }
 
 impl crate::Service for Service {
@@ -109,11 +97,9 @@ impl crate::Service for Service {
 				userdeviceid_spentrefresh: args.db["userdeviceid_spentrefresh"].clone(),
 				userdeviceidalgorithm_fallback: args.db["userdeviceidalgorithm_fallback"].clone(),
 				userfilterid_filter: args.db["userfilterid_filter"].clone(),
-				userid_avatarurl: args.db["userid_avatarurl"].clone(),
-				userid_blurhash: args.db["userid_blurhash"].clone(),
 				userid_dehydrateddevice: args.db["userid_dehydrateddevice"].clone(),
 				userid_devicelistversion: args.db["userid_devicelistversion"].clone(),
-				userid_displayname: args.db["userid_displayname"].clone(),
+				userid_erased: args.db["userid_erased"].clone(),
 				userid_lastonetimekeyupdate: args.db["userid_lastonetimekeyupdate"].clone(),
 				userid_locked: args.db["userid_locked"].clone(),
 				userid_masterkeyid: args.db["userid_masterkeyid"].clone(),
@@ -122,7 +108,6 @@ impl crate::Service for Service {
 				userid_selfsigningkeyid: args.db["userid_selfsigningkeyid"].clone(),
 				userid_suspended: args.db["userid_suspended"].clone(),
 				userid_usersigningkeyid: args.db["userid_usersigningkeyid"].clone(),
-				useridprofilekey_value: args.db["useridprofilekey_value"].clone(),
 			},
 		}))
 	}
@@ -224,6 +209,29 @@ impl Service {
 		self.services.globals.user_is_local(user_id) && self.is_active(user_id).await
 	}
 
+	/// Gate an LDAP-authenticated login into an existing local account: it must
+	/// be an LDAP-origin account (not a same-named password or SSO account) and
+	/// active. A localpart with no local account yet passes.
+	pub async fn check_ldap_login(&self, user_id: &UserId) -> Result {
+		if !self.exists(user_id).await {
+			return Ok(());
+		}
+
+		if self
+			.origin(user_id)
+			.await
+			.is_ok_and(|origin| origin != "ldap")
+		{
+			return Err!(Request(Forbidden("Account does not permit LDAP login.")));
+		}
+
+		if !self.is_active_local(user_id).await {
+			return Err!(Request(UserDeactivated("This user has been deactivated.")));
+		}
+
+		Ok(())
+	}
+
 	/// MSC3823: account is suspended (read-mostly mode, sessions retained).
 	pub async fn is_suspended(&self, user_id: &UserId) -> bool {
 		self.db
@@ -236,6 +244,24 @@ impl Service {
 	/// MSC3939: account is locked (401 + soft_logout, sessions retained).
 	pub async fn is_locked(&self, user_id: &UserId) -> bool {
 		self.db.userid_locked.get(user_id).await.is_ok()
+	}
+
+	/// MSC4025: the user's events serve as pruned copies to recipients not
+	/// joined at the event. Presence-only for the serving gate.
+	pub async fn is_erased(&self, user_id: &UserId) -> bool {
+		self.db.userid_erased.get(user_id).await.is_ok()
+	}
+
+	/// MSC4025: the global count recorded at erasure, for admin surfacing;
+	/// the serving gate never reads it.
+	pub async fn erasure_count(&self, user_id: &UserId) -> Option<PduCount> {
+		self.db
+			.userid_erased
+			.get(user_id)
+			.await
+			.deserialized()
+			.map(PduCount::from_unsigned)
+			.ok()
 	}
 
 	/// MSC3823: forensic record for the active suspension, if any.
@@ -272,6 +298,17 @@ impl Service {
 	}
 
 	pub fn clear_suspended(&self, user_id: &UserId) { self.db.userid_suspended.remove(user_id); }
+
+	/// MSC4025: mark the user erased, recording the current global count.
+	pub fn set_erased(&self, user_id: &UserId) {
+		let count = self.services.globals.current_count();
+
+		self.db.userid_erased.raw_put(user_id, count);
+	}
+
+	/// MSC4025: erasure is reversible; clearing the marker restores the
+	/// unredacted view.
+	pub fn clear_erased(&self, user_id: &UserId) { self.db.userid_erased.remove(user_id); }
 
 	pub fn set_locked(&self, user_id: &UserId, by: &UserId) {
 		let entry = Moderation {
@@ -532,27 +569,7 @@ impl Service {
 		Err!(FeatureDisabled("ldap"))
 	}
 
-	async fn update_all_rooms<'a, S>(&self, user_id: &UserId, rooms: S)
-	where
-		S: Stream<Item = (PduBuilder, &'a OwnedRoomId)> + Send,
-	{
-		rooms
-			.for_each_concurrent(automatic_width(), async |(pdu_builder, room_id)| {
-				let state_lock = self.services.state.mutex.lock(room_id).await;
-				if let Err(e) = self
-					.services
-					.timeline
-					.build_and_append_pdu(pdu_builder, user_id, room_id, &state_lock)
-					.await
-				{
-					warn!(
-						%user_id,
-						%room_id,
-						%e,
-						"Failed to update/send new profile join membership update in room",
-					);
-				}
-			})
-			.await;
-	}
+	#[cfg(not(feature = "ldap"))]
+	#[must_use]
+	pub fn ldap_bind_dn(&self, _localpart: &str) -> Option<String> { None }
 }

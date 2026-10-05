@@ -23,7 +23,7 @@ pub(super) async fn issue(
 	let (token, info) = self
 		.services
 		.registration_tokens
-		.issue_token(expires)
+		.create_token(None, None, expires)
 		.await?;
 
 	write!(self, "New registration token issued: `{token}` - {info}").await

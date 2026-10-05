@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod tests;
+
 use std::{
 	sync::{
 		Arc,
@@ -20,6 +23,9 @@ pub struct Server {
 	/// Server-wide configuration instance
 	pub config: config::Manager,
 
+	/// Where the configuration came from, replayed on reload.
+	pub config_sources: config::Sources,
+
 	/// Timestamp server was started; used for uptime.
 	pub started: SystemTime,
 
@@ -33,6 +39,12 @@ pub struct Server {
 
 	/// Restart desired; when true, restart it desired after shutdown.
 	pub restarting: AtomicBool,
+
+	/// Set when a backup restore is claimed, which is before it runs and is not
+	/// undone if it fails, so a database reopened later in the same process
+	/// does not restore a second time. Clearing this re-arms a destructive
+	/// operation and is never correct; claim it instead.
+	pub backup_restored: AtomicBool,
 
 	/// Handle to the runtime
 	pub runtime: Option<runtime::Handle>,
@@ -51,6 +63,7 @@ impl Server {
 	#[must_use]
 	pub fn new(
 		config: Config,
+		config_sources: config::Sources,
 		runtime: Option<&runtime::Handle>,
 		log: Logging,
 		metrics: Arc<Metrics>,
@@ -58,10 +71,12 @@ impl Server {
 		Self {
 			name: config.server_name.clone(),
 			config: config::Manager::new(config),
+			config_sources,
 			started: SystemTime::now(),
 			stopping: AtomicBool::new(false),
 			reloading: AtomicBool::new(false),
 			restarting: AtomicBool::new(false),
+			backup_restored: AtomicBool::new(false),
 			runtime: runtime.cloned(),
 			signal: broadcast::channel::<&'static str>(1).0,
 			log,
@@ -106,6 +121,13 @@ impl Server {
 		self.signal("SIGTERM").inspect_err(|_| {
 			self.stopping.store(false, Ordering::Release);
 		})
+	}
+
+	/// Claims the one-shot backup restore, reporting whether this caller is the
+	/// one to perform it.
+	#[inline]
+	pub fn claim_backup_restore(&self) -> bool {
+		!self.backup_restored.swap(true, Ordering::AcqRel)
 	}
 
 	pub fn signal(&self, sig: &'static str) -> Result {

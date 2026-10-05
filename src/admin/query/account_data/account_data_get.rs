@@ -1,5 +1,4 @@
 use ruma::{OwnedRoomId, OwnedUserId};
-use tokio::time::Instant;
 use tuwunel_core::Result;
 use tuwunel_database::Deserialized;
 
@@ -12,14 +11,13 @@ pub(super) async fn account_data_get(
 	kind: String,
 	room_id: Option<OwnedRoomId>,
 ) -> Result {
-	let timer = Instant::now();
-	let results: serde_json::Value = self
-		.services
-		.account_data
-		.get_raw(room_id.as_deref(), &user_id, &kind)
-		.await
-		.deserialized()?;
-	let query_time = timer.elapsed();
+	let query = async {
+		self.services
+			.account_data
+			.get_raw(room_id.as_deref(), &user_id, &kind)
+			.await
+			.deserialized::<serde_json::Value>()
+	};
 
-	write!(self, "Query completed in {query_time:?}:\n\n```rs\n{results:#?}\n```").await
+	self.write_timed_query_try(query).await
 }

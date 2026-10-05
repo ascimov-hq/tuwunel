@@ -1,0 +1,19 @@
+[Unit]
+Description=Tuwunel Matrix homeserver socket
+Documentation=https://tuwunel.chat/
+
+[Socket]
+# Systemd binds this and hands it to Tuwunel at startup, so the server reaches
+# a privileged port while holding no capability of its own. Sockets listed here
+# are served in addition to the address, port and unix socket in the
+# configuration file, and take precedence where the two overlap.
+ListenStream=8448
+#ListenStream=443
+#ListenStream=[::1]:8008
+
+BindIPv6Only=both
+Backlog=1024
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

@@ -15,7 +15,7 @@ use tuwunel_service::{
 };
 use url::Url;
 
-use super::{OIDC_REQ_ID_LENGTH, url_encode};
+use super::{OIDC_REQ_ID_LENGTH, sso_redirect_url};
 use crate::ClientIp;
 
 #[derive(Debug, Deserialize)]
@@ -31,8 +31,8 @@ pub(crate) struct AuthorizeParams {
 	code_challenge_method: Option<String>,
 	#[serde(default)]
 	idp_id: Option<String>,
-	#[serde(default, rename = "prompt")]
-	_prompt: Option<String>,
+	#[serde(default)]
+	prompt: Option<String>,
 }
 
 pub(crate) async fn authorize_route(
@@ -73,21 +73,34 @@ pub(crate) async fn authorize_route(
 
 	let now = SystemTime::now();
 	let req_id = utils::random_string(OIDC_REQ_ID_LENGTH);
-	let idp_id = match params.idp_id.as_deref() {
+	let base = oidc.issuer_url()?;
+	let base = base.trim_end_matches('/');
+
+	let resolved_idp: Option<String> = match params.idp_id.as_deref() {
 		| Some(requested) => services
 			.oauth
 			.providers
 			.get_config(requested)
-			.map(|provider| provider.id().to_owned())
+			.map(|provider| Some(provider.id().to_owned()))
 			.map_err(|_| err!(Request(InvalidParam("Unrecognized identity provider"))))?,
 
-		| None => services
-			.oauth
-			.providers
-			.get_default_id()
-			.ok_or_else(|| {
-				err!(Config("identity_provider", "No identity provider configured"))
-			})?,
+		| None => services.oauth.providers.get_default_id(),
+	};
+
+	// Native page when native auth is on and no external provider applies, or the
+	// client explicitly requested account creation (prompt=create).
+	let serve_native = params.idp_id.is_none()
+		&& should_serve_native(
+			services.config.oidc_native_auth,
+			resolved_idp.is_some(),
+			params.prompt.as_deref() == Some("create"),
+		);
+
+	let idp_id = match (serve_native, resolved_idp) {
+		| (true, _) => None,
+		| (false, Some(idp_id)) => Some(idp_id),
+		| (false, None) =>
+			return Err!(Config("identity_provider", "No identity provider configured")),
 	};
 
 	let auth_req = AuthRequest {
@@ -98,9 +111,9 @@ pub(crate) async fn authorize_route(
 		nonce: params.nonce,
 		code_challenge: params.code_challenge,
 		code_challenge_method: params.code_challenge_method,
-		// Record which IdP authenticated the user so it can be tagged on the
-		// device at token exchange time and used for UIAA SSO provider binding.
-		idp_id: Some(idp_id.clone()),
+		// The IdP that authenticated the user, tagged on the device at token
+		// exchange; absent in native mode (the account is local).
+		idp_id: idp_id.clone(),
 		response_mode: params.response_mode,
 		created_at: now,
 		expires_at: now
@@ -108,30 +121,51 @@ pub(crate) async fn authorize_route(
 			.unwrap_or(now),
 	};
 
-	let base = oidc.issuer_url()?;
-	let base = base.trim_end_matches('/');
+	oidc.store_auth_request(&req_id, &auth_req);
+
+	let Some(idp_id) = idp_id else {
+		let view = match params.prompt.as_deref() {
+			| Some("create") => "register",
+			| _ => "login",
+		};
+
+		let native_url = Url::parse(&format!("{base}/_tuwunel/oidc/native"))
+			.map_err(|_| err!(error!("Failed to build native auth URL")))
+			.map(|mut url| {
+				url.query_pairs_mut()
+					.append_pair("oidc_req_id", &req_id)
+					.append_pair("view", view);
+
+				url
+			})?;
+
+		return Ok(Redirect::temporary(native_url.as_str()));
+	};
 
 	let complete_url = Url::parse(&format!("{base}/_tuwunel/oidc/_complete"))
 		.map_err(|_| err!(error!("Failed to build complete URL")))
 		.map(|mut url| {
 			url.query_pairs_mut()
 				.append_pair("oidc_req_id", &req_id);
+
 			url
 		})?;
 
-	let idp_id_enc = url_encode(&idp_id);
-	let sso_url =
-		Url::parse(&format!("{base}/_matrix/client/v3/login/sso/redirect/{idp_id_enc}"))
-			.map_err(|_| err!(error!("Failed to build SSO URL")))
-			.map(|mut url| {
-				url.query_pairs_mut()
-					.append_pair("redirectUrl", complete_url.as_str());
-				url
-			})?;
-
-	oidc.store_auth_request(&req_id, &auth_req);
+	let sso_url = sso_redirect_url(base, &idp_id, &complete_url)?;
 
 	Ok(Redirect::temporary(sso_url.as_str()))
+}
+
+/// Decide whether a request with no explicitly-selected provider is served the
+/// native login/register page rather than an upstream-IdP SSO redirect. Native
+/// applies when enabled and either no default IdP is configured or the client
+/// asked to create an account.
+pub(super) fn should_serve_native(
+	native_enabled: bool,
+	has_default_idp: bool,
+	wants_create: bool,
+) -> bool {
+	native_enabled && (!has_default_idp || wants_create)
 }
 
 async fn validate_redirect_uri(services: &Services, params: &AuthorizeParams) -> Result {
@@ -166,4 +200,25 @@ fn is_loopback_redirect(uri: &Url) -> bool {
 	let addr = || uri.host_str().map(str::parse::<IpAddr>).flat_ok();
 
 	uri.scheme() == "http" && matches!(addr(), Some(ip) if ip.is_loopback())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::should_serve_native;
+
+	#[test]
+	fn native_decision_truth_table() {
+		// Native auth disabled: never native.
+		assert!(!should_serve_native(false, false, false));
+		assert!(!should_serve_native(false, true, true));
+
+		// Native-only (no default provider): native.
+		assert!(should_serve_native(true, false, false));
+
+		// An external default is configured, ordinary login: SSO to the default.
+		assert!(!should_serve_native(true, true, false));
+
+		// An external default is configured, prompt=create: native registration.
+		assert!(should_serve_native(true, true, true));
+	}
 }

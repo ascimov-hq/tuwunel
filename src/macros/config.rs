@@ -47,7 +47,6 @@ pub(super) fn example_generator(input: ItemStruct, args: &[Meta]) -> Result<Toke
 		.into())
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn generate_example(input: &ItemStruct, args: &[Meta], emit: bool) -> Result<TokenStream2> {
 	let settings = get_simple_settings(args);
 
@@ -276,7 +275,12 @@ fn get_doc_comment(field: &Field) -> Option<String> {
 				line.trim().starts_with(key) && line.trim().chars().nth(key.len()) == Some(':')
 			})
 		})
-		.fold(String::new(), |full, line| full + "#" + line + "\n");
+		.fold(String::new(), |mut full, line| {
+			full.push('#');
+			full.push_str(line);
+			full.push('\n');
+			full
+		});
 
 	(!out.is_empty()).then_some(out)
 }

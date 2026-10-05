@@ -1,5 +1,4 @@
 use ruma::{OwnedDeviceId, OwnedUserId};
-use tokio::time::Instant;
 use tuwunel_core::Result;
 
 use crate::admin_command;
@@ -10,13 +9,10 @@ pub(super) async fn count_one_time_keys(
 	user_id: OwnedUserId,
 	device_id: OwnedDeviceId,
 ) -> Result {
-	let timer = Instant::now();
-	let result = self
+	let query = self
 		.services
 		.users
-		.count_one_time_keys(&user_id, &device_id)
-		.await;
-	let query_time = timer.elapsed();
+		.count_one_time_keys(&user_id, &device_id);
 
-	write!(self, "Query completed in {query_time:?}:\n\n```rs\n{result:#?}\n```").await
+	self.write_timed_query(query).await
 }

@@ -2,7 +2,6 @@ use axum::extract::State;
 use futures::{FutureExt, future::try_join};
 use ruma::{
 	OwnedServerName, OwnedUserId,
-	RoomVersionId::*,
 	api::federation::membership::{RawStrippedState, create_knock_event},
 	events::{
 		StateEventType,
@@ -12,10 +11,11 @@ use ruma::{
 };
 use tuwunel_core::{
 	Err, Result, at, err,
-	matrix::{event::gen_event_id_canonical_json, pdu::PduEvent},
+	matrix::{event::gen_event_id_canonical_json, pdu::PduEvent, room_version},
 	warn,
 };
 
+use super::utils::require_known_room;
 use crate::Ruma;
 
 /// # `PUT /_matrix/federation/v1/send_knock/{roomId}/{eventId}`
@@ -39,22 +39,21 @@ pub(crate) async fn create_knock_event_v1_route(
 		return Err!(Request(Forbidden("Server is banned on this homeserver.")));
 	}
 
-	if !services.metadata.exists(&body.room_id).await {
-		return Err!(Request(NotFound("Room is unknown to this server.")));
-	}
-
-	// ACL check origin server
 	services
-		.event_handler
-		.acl_check(body.origin(), &body.room_id)
-		.await?;
+		.sending
+		.notify_peer_alive(body.origin())
+		.await;
+
+	require_known_room(&services, &body.room_id, body.origin()).await?;
 
 	let room_version_id = services
 		.state
 		.get_room_version(&body.room_id)
 		.await?;
 
-	if matches!(room_version_id, V1 | V2 | V3 | V4 | V5 | V6) {
+	let room_version_rules = room_version::rules(&room_version_id)?;
+
+	if !room_version_rules.authorization.knocking {
 		return Err!(Request(Forbidden("Room version does not support knocking.")));
 	}
 
@@ -152,7 +151,6 @@ pub(crate) async fn create_knock_event_v1_route(
 	let pdu_id = services
 		.event_handler
 		.handle_incoming_pdu(&origin, &body.room_id, &event_id, value.clone(), true)
-		.boxed()
 		.await?
 		.map(at!(0))
 		.ok_or_else(|| err!(Request(InvalidParam("Could not accept as timeline event."))))?;

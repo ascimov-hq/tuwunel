@@ -4,7 +4,7 @@ use axum::extract::State;
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, future::try_join4};
 use ruma::{
 	CanonicalJsonObject, OwnedEventId, OwnedRoomId, OwnedServerName, OwnedUserId, RoomId,
-	RoomVersionId, ServerName, UserId,
+	ServerName, UserId,
 	api::federation::membership::create_join_event,
 	events::{
 		StateEventType,
@@ -15,7 +15,7 @@ use serde_json::value::RawValue as RawJsonValue;
 use tuwunel_core::{
 	Err, Result, at, debug_error, err,
 	itertools::Itertools,
-	matrix::event::gen_event_id_canonical_json,
+	matrix::{RoomVersionRules, event::gen_event_id_canonical_json, room_version},
 	utils::{
 		BoolExt,
 		future::{BoolExt as _, ReadyBoolExt},
@@ -25,6 +25,7 @@ use tuwunel_core::{
 };
 use tuwunel_service::Services;
 
+use super::utils::require_known_room;
 use crate::{Ruma, client::sync::calculate_heroes};
 
 /// # `PUT /_matrix/federation/v2/send_join/{roomId}/{eventId}`
@@ -52,6 +53,8 @@ pub(crate) async fn create_join_event_v2_route(
 			"Room ID server name {server} is banned on this homeserver."
 		))));
 	}
+
+	services.sending.notify_peer_alive(origin).await;
 
 	// Get the servers in the room BEFORE the join
 	let servers_in_room = members_omitted
@@ -83,15 +86,7 @@ async fn create_join_event(
 	pdu: &RawJsonValue,
 	omit_members: bool,
 ) -> Result<create_join_event::v2::RoomState> {
-	if !services.metadata.exists(room_id).await {
-		return Err!(Request(NotFound("Room is unknown to this server.")));
-	}
-
-	// ACL check origin server
-	services
-		.event_handler
-		.acl_check(origin, room_id)
-		.await?;
+	require_known_room(services, room_id, origin).await?;
 
 	// We need to return the state prior to joining, let's keep a reference to that
 	// here
@@ -103,9 +98,9 @@ async fn create_join_event(
 
 	// We do not add the event_id field to the pdu here because of signature and
 	// hashes checks
-	let room_version = services.state.get_room_version(room_id).await?;
+	let room_version_id = services.state.get_room_version(room_id).await?;
 
-	let Ok((event_id, mut value)) = gen_event_id_canonical_json(pdu, &room_version) else {
+	let Ok((event_id, mut value)) = gen_event_id_canonical_json(pdu, &room_version_id) else {
 		// Event could not be converted to canonical json
 		return Err!(Request(BadJson("Could not convert event to canonical json.")));
 	};
@@ -113,20 +108,22 @@ async fn create_join_event(
 	let (content, joining_user) =
 		validate_join_event_shape(services, &value, origin, room_id).await?;
 
+	let room_version_rules = room_version::rules(&room_version_id)?;
+
 	if let Some(authorising_user) = content.join_authorized_via_users_server {
 		validate_restricted_join(
 			services,
 			&authorising_user,
 			&joining_user,
 			room_id,
-			&room_version,
+			&room_version_rules,
 		)
 		.await?;
 	}
 
 	services
 		.server_keys
-		.hash_and_sign_event(&mut value, &room_version)
+		.hash_and_sign_event(&mut value, &room_version_id)
 		.map_err(|e| err!(Request(InvalidParam(warn!("Failed to sign send_join event: {e}")))))?;
 
 	let origin: OwnedServerName = serde_json::from_value(
@@ -193,7 +190,6 @@ async fn create_join_event(
 	let pdu_id = services
 		.event_handler
 		.handle_incoming_pdu(&origin, room_id, &event_id, value.clone(), true)
-		.boxed()
 		.await?
 		.map(at!(0))
 		.ok_or_else(|| err!(Request(InvalidParam("Could not accept as timeline event."))))?;
@@ -210,7 +206,7 @@ async fn create_join_event(
 	let into_federation_format = |pdu: CanonicalJsonObject| {
 		services
 			.federation
-			.format_pdu_into(pdu, Some(&room_version))
+			.format_pdu_into(pdu, Some(&room_version_id))
 			.map(Ok)
 	};
 
@@ -222,7 +218,7 @@ async fn create_join_event(
 
 	let auth_chain = services
 		.auth_chain
-		.event_ids_iter(room_id, &room_version, auth_heads)
+		.event_ids_iter(room_id, &room_version_id, auth_heads)
 		.ready_try_filter(include_auth_event)
 		.broad_and_then(async |event_id| {
 			services
@@ -250,7 +246,7 @@ async fn create_join_event(
 	// Join event for new server.
 	let event = services
 		.federation
-		.format_pdu_into(value, Some(&room_version))
+		.format_pdu_into(value, Some(&room_version_id))
 		.map(Some)
 		.map(Ok);
 
@@ -359,13 +355,14 @@ async fn validate_restricted_join(
 	authorising_user: &UserId,
 	joining_user: &UserId,
 	room_id: &RoomId,
-	room_version: &RoomVersionId,
+	room_version_rules: &RoomVersionRules,
 ) -> Result {
-	use RoomVersionId::*;
-
-	if matches!(room_version, V1 | V2 | V3 | V4 | V5 | V6 | V7) {
+	if !room_version_rules
+		.authorization
+		.restricted_join_rule
+	{
 		return Err!(Request(InvalidParam(
-			"Room version {room_version} does not support restricted rooms but \
+			"Room version does not support restricted rooms but \
 			 join_authorised_via_users_server ({authorising_user}) was found in the event."
 		)));
 	}
@@ -388,8 +385,13 @@ async fn validate_restricted_join(
 		)));
 	}
 
-	if !super::user_can_perform_restricted_join(services, joining_user, room_id, room_version)
-		.await?
+	if !super::user_can_perform_restricted_join(
+		services,
+		joining_user,
+		room_id,
+		room_version_rules,
+	)
+	.await?
 	{
 		return Err!(Request(UnableToAuthorizeJoin(
 			"Joining user did not pass restricted room's rules."

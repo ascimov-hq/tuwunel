@@ -1,4 +1,10 @@
+//! Random value generation and randomized truncation helpers.
+//!
+//! These helpers use the thread-local generator for strings, indexes, shuffles,
+//! durations, and event identifiers. Range arguments use half-open semantics.
+
 use std::{
+	iter::repeat_with,
 	ops::Range,
 	time::{Duration, SystemTime},
 };
@@ -7,12 +13,20 @@ use arrayvec::ArrayString;
 use rand::{RngExt, rng, seq::SliceRandom};
 use ruma::OwnedEventId;
 
+/// Randomly permutes a slice in place.
+///
+/// The thread-local generator chooses the permutation without changing the
+/// slice's contents or length. Empty and single-element slices remain
+/// unchanged.
 pub fn shuffle<T>(vec: &mut [T]) {
 	let mut rng = rng();
 	vec.shuffle(&mut rng);
 }
 
-/// A uniform random index into `0..len`, or `0` when `len` is `0`.
+/// Chooses a uniformly random index below `len`.
+///
+/// A zero length returns `0` instead of sampling an empty range. For any
+/// nonzero length, the result lies in `0..len`.
 #[must_use]
 pub fn index(len: usize) -> usize {
 	match len {
@@ -21,6 +35,10 @@ pub fn index(len: usize) -> usize {
 	}
 }
 
+/// Generates an alphanumeric ASCII string of the requested byte length.
+///
+/// Each character is sampled independently with the thread-local generator.
+/// Because the alphabet is ASCII, the character and byte lengths are equal.
 pub fn string(length: usize) -> String {
 	rng()
 		.sample_iter(&rand::distr::Alphanumeric)
@@ -29,15 +47,24 @@ pub fn string(length: usize) -> String {
 		.collect()
 }
 
-/// A random string of `length` characters drawn uniformly from `charset`.
+/// Generates a string of `length` characters sampled from `charset`.
+///
+/// Each byte becomes the Unicode scalar with the same numeric value, and
+/// samples are uniform with replacement. Sampling panics when `charset` is
+/// empty and a positive length is requested.
 #[must_use]
 pub fn string_from(charset: &[u8], length: usize) -> String {
 	let mut rng = rng();
-	(0..length)
-		.map(|_| char::from(charset[rng.random_range(0..charset.len())]))
+
+	repeat_with(|| char::from(charset[rng.random_range(0..charset.len())]))
+		.take(length)
 		.collect()
 }
 
+/// Generates an alphanumeric ASCII string that fills a fixed-capacity array.
+///
+/// Each sample occupies one byte, so the returned length and capacity are both
+/// `LENGTH`. The [`ArrayString`] stores the result without heap allocation.
 #[inline]
 pub fn string_array<const LENGTH: usize>() -> ArrayString<LENGTH> {
 	let mut ret = ArrayString::<LENGTH>::new();
@@ -50,6 +77,10 @@ pub fn string_array<const LENGTH: usize>() -> ArrayString<LENGTH> {
 	ret
 }
 
+/// Generates a Matrix event identifier from 32 random bytes.
+///
+/// The bytes use URL-safe base64 without padding, producing a 43-character
+/// localpart after the `$` sigil. The identifier has no server-name component.
 #[must_use]
 pub fn event_id() -> OwnedEventId {
 	use base64::{
@@ -73,6 +104,11 @@ pub fn event_id() -> OwnedEventId {
 		.expect("Failed to generate valid random event_id")
 }
 
+/// Truncates an owned string at a randomly selected character count.
+///
+/// The count is sampled from the half-open range and never splits a UTF-8
+/// scalar. A count at or beyond the string's character count leaves it intact;
+/// an invalid or empty range panics.
 #[must_use]
 pub fn truncate_string(mut str: String, range: Range<u64>) -> String {
 	let len = rng()
@@ -87,6 +123,11 @@ pub fn truncate_string(mut str: String, range: Range<u64>) -> String {
 	str
 }
 
+/// Borrows a prefix ending at a randomly selected character count.
+///
+/// The count is sampled from the half-open range and never splits a UTF-8
+/// scalar. A count at or beyond the string's character count returns the full
+/// input; an invalid or empty range panics.
 #[inline]
 #[must_use]
 pub fn truncate_str(str: &str, range: Range<u64>) -> &str {
@@ -101,6 +142,10 @@ pub fn truncate_str(str: &str, range: Range<u64>) -> &str {
 		.unwrap_or(str)
 }
 
+/// Adds a random whole-second offset to the current [`SystemTime`].
+///
+/// The offset is sampled from the supplied half-open range. The function panics
+/// if the range is invalid or the addition exceeds [`SystemTime`].
 #[inline]
 #[must_use]
 pub fn time_from_now_secs(range: Range<u64>) -> SystemTime {
@@ -109,6 +154,10 @@ pub fn time_from_now_secs(range: Range<u64>) -> SystemTime {
 		.expect("range does not overflow SystemTime")
 }
 
+/// Generates a [`Duration`] with a random whole-second length.
+///
+/// The number of seconds is sampled uniformly from the supplied half-open
+/// range. An invalid or empty range panics.
 #[must_use]
 pub fn secs(range: Range<u64>) -> Duration {
 	let mut rng = rng();

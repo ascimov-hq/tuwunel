@@ -59,12 +59,12 @@ pub struct Cbor<T>(pub T);
 
 /// Directive to force separator serialization specifically for prefix keying
 /// use. This is a quirk of the database schema and prefix iterations.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize)]
 pub struct Interfix;
 
 /// Directive to force separator serialization. Separators are usually
 /// serialized automatically.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize)]
 pub struct Separator;
 
 /// Record separator; an intentionally invalid-utf8 byte.
@@ -191,13 +191,13 @@ impl<W: Write> ser::Serializer for &mut Serializer<'_, W> {
 		);
 
 		match name {
-			| "Json" => serde_json::to_writer(&mut self.out, value).map_err(Into::into),
+			| "Json" => serde_json::to_writer(&mut *self.out, value).map_err(Into::into),
 			| "Cbor" => {
 				use minicbor::encode::write::Writer;
 				use minicbor_serde::Serializer;
 
 				value
-					.serialize(&mut Serializer::new(&mut Writer::new(&mut self.out)))
+					.serialize(&mut Serializer::new(&mut Writer::new(&mut *self.out)))
 					.map_err(|e| Self::Error::SerdeSer(e.to_string().into()))
 			},
 			| _ => unhandled!("Unrecognized serialization Newtype {name:?}"),

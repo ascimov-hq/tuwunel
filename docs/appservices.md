@@ -87,6 +87,7 @@ Fields under `[global.appservice.<ID>]`:
 | `protocols` | `[]` | Protocols bridged (e.g. `["irc"]`). Reported via the `/thirdparty/protocols` endpoint. |
 | `receive_ephemeral` | `false` | Include ephemeral events (typing notifications, read receipts) in pushes to the appservice. |
 | `device_management` | `false` | Allow the appservice to manage devices on behalf of virtual users ([MSC4190](https://github.com/matrix-org/matrix-spec-proposals/pull/4190)). |
+| `msc3202_transaction_extensions` | `false` | Include end-to-bridge encryption bookkeeping (device-list changes, one-time-key counts, unused fallback key types) in pushes, so encrypting bridges work without a `/sync` loop ([MSC3202](https://github.com/matrix-org/matrix-spec-proposals/pull/3202), paired with to-device delivery from [MSC4203](https://github.com/matrix-org/matrix-spec-proposals/pull/4203)). The registration-file key is `org.matrix.msc3202`. |
 
 Namespace entries under `[[global.appservice.<ID>.users]]`, `aliases`, and `rooms`:
 
@@ -115,6 +116,7 @@ These options go in the top-level `[global]` section:
 | `appservice_timeout` | `35` | Request timeout in seconds when pushing events to an appservice. |
 | `appservice_idle_timeout` | `300` | Idle connection pool timeout in seconds. |
 | `dns_passthru_appservices` | `false` | Bypass DNS passthru domain matching for all appservice URLs. More efficient than listing each domain in `dns_passthru_domains` when all appservices share the same network. |
+| `appservice_key_proxy` | `[]` | Registration IDs of the appservices that serve the unstable one-time key claim ([MSC3983](https://github.com/matrix-org/matrix-spec-proposals/pull/3983)) and device key query ([MSC3984](https://github.com/matrix-org/matrix-spec-proposals/pull/3984)) routes. Claims and queries for those appservices' exclusive users (and senders) are forwarded to them; the default forwards nothing. A 404, 405 or `M_UNRECOGNIZED` answer is logged at debug level. Reloadable. |
 
 ## Getting help
 

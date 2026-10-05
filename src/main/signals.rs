@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use tokio::signal;
-use tuwunel_core::{debug_error, trace, warn};
+#[cfg(unix)]
+use tuwunel_core::trace;
+use tuwunel_core::{debug_error, warn};
 
 use super::server::Server;
 
@@ -53,8 +55,8 @@ pub async fn enable(server: Arc<Server>) {
 			() = server.server.until_shutdown() => break,
 			_ = signal::ctrl_c() => {
 				warn!("Received Ctrl+C");
-				if let Err(e) = server.server.signal.send("SIGINT") {
-					debug_error!("signal channel: {e}");
+				if let Err(e) = server.server.shutdown() {
+					debug_error!("shutdown: {e}");
 				}
 			},
 		}

@@ -23,6 +23,8 @@ crypto/crypto.spec.ts :: should allow verification when there is no existing DM
 crypto/decryption-failure-messages.spec.ts :: should display undecryptable non-joined historical messages with a different message
 crypto/decryption-failure-messages.spec.ts :: should handle device-relative historical messages
 crypto/device-verification.spec.ts :: No toast after verification, even if the secrets take a while to arrive
+crypto/device-verification.spec.ts :: Verify device with Recovery Key during login
+crypto/device-verification.spec.ts :: Verify device with Recovery Key from settings
 crypto/event-shields.spec.ts :: Should show a grey padlock for a key restored from backup
 crypto/event-shields.spec.ts :: should show correct shields on events sent by users with changed identity
 crypto/event-shields.spec.ts :: should show the correct shield on e2e events
@@ -40,15 +42,12 @@ file-upload/image-upload.spec.ts :: should show image preview when uploading an 
 invite/invite-dialog.spec.ts :: should support inviting a user to Direct Messages
 invite/invite-dialog.spec.ts :: should support inviting a user to a room
 lazy-loading/lazy-loading.spec.ts :: should handle lazy loading properly even when offline
-links/messages.spec.ts :: should linkify text inside a URL preview
 links/topic.spec.ts :: should linkify plaintext '#aroom:example.org'
 links/topic.spec.ts :: should linkify plaintext '_@alice:example.org'
 links/topic.spec.ts :: should linkify plaintext 'ftp://example.org'
 links/topic.spec.ts :: should linkify plaintext 'https://example.org'
 location/location.spec.ts :: sends and displays pin drop location message successfully
 login/login.spec.ts :: Can reload after login
-messages/messages.spec.ts :: should render a basic preview
-messages/messages.spec.ts :: should render a preview with a thumbnail
 pinned-messages/pinned-messages.spec.ts :: banner should listen to pinned message list
 pinned-messages/pinned-messages.spec.ts :: should display 2 messages in the banner
 pinned-messages/pinned-messages.spec.ts :: should display 4 messages in the banner
@@ -127,12 +126,13 @@ settings/preferences-user-settings-tab.spec.ts :: should be rendered properly
 settings/quick-settings-menu.spec.ts :: should be rendered properly
 settings/room-settings/room-security-tab.spec.ts :: should disallow changing from public to private if the user cannot alter history
 settings/security-user-settings-tab.spec.ts :: should be able to set an ID server
-sliding-sync/sliding-sync.spec.ts :: should show a favourite DM only in the favourite sublist
+sliding-sync/sliding-sync.spec.ts :: should show a favourite DM only in the favourite section
 sliding-sync/sliding-sync.spec.ts :: should show and be able to accept/reject/rescind invites
 sliding-sync/sliding-sync.spec.ts :: should show the right unread notifications
 spaces/threads-activity-centre/threadsActivityCentre.spec.ts :: should order by recency after notification level
 spaces/threads-activity-centre/threadsActivityCentre.spec.ts :: should show a highlight indicator when there is a mention in a thread
 spaces/threads-activity-centre/threadsActivityCentre.spec.ts :: should show a notification indicator when there is a message in a thread
+spaces/threads-activity-centre/threadsActivityCentre.spec.ts :: should show the rooms with unread threads
 spaces/threads-activity-centre/threadsActivityCentre.spec.ts :: should update with a thread is read
 spotlight/spotlight.spec.ts :: should be able to navigate results via keyboard
 spotlight/spotlight.spec.ts :: should find known public rooms

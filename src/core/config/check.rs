@@ -1,12 +1,17 @@
-use std::{env::consts::OS, fs::read_to_string, net::SocketAddr};
+use std::{
+	env::consts::OS,
+	fs::read_to_string,
+	net::{IpAddr, SocketAddr},
+};
 
 use either::Either;
+use http::HeaderValue;
 use itertools::Itertools;
 use regex::RegexSet;
 use url::Url;
 
 use super::{DEPRECATED_KEYS, IdentityProvider, IpSource, KNOWN_KEYS};
-use crate::{Config, Err, Result, debug, debug_info, err, error, warn};
+use crate::{Config, Err, Result, debug, debug_info, err, error, utils::is_secret_set, warn};
 
 /// Performs check() with additional checks specific to reloading old config
 /// with new config.
@@ -128,6 +133,15 @@ fn check_network(config: &Config) -> Result {
 			.get_bind_addrs()
 			.iter()
 			.for_each(warn_loopback_in_container);
+	}
+
+	for server in &config.dns_servers {
+		if server.parse::<SocketAddr>().is_err() && server.parse::<IpAddr>().is_err() {
+			return Err!(Config(
+				"dns_servers",
+				"{server:?} is not an IP address or socket address."
+			));
+		}
 	}
 
 	// check if user specified valid IP CIDR ranges on startup
@@ -321,9 +335,9 @@ fn check_registration_terms(config: &Config) -> Result {
 }
 
 fn check_turn_and_media_misc(config: &Config) -> Result {
+	// A blank secret resolves to none at all, so it is checked the same way here.
 	if !config.turn_uris.is_empty()
-		&& config.turn_secret.is_none()
-		&& config.turn_secret_file.is_none()
+		&& !is_secret_set(config.turn_secret_file.as_deref(), config.turn_secret.as_deref())
 		&& config.turn_username.is_empty()
 		&& config.turn_password.is_empty()
 	{
@@ -355,6 +369,44 @@ fn check_turn_and_media_misc(config: &Config) -> Result {
 			"Push suppression when active is enabled (EXPERIMENTAL): behavior may change or be \
 			 unstable. Disable by removing or setting suppress_push_when_active to false."
 		);
+	}
+
+	check_thumbnails(config)?;
+	check_video_thumbnails(config)
+}
+
+fn check_thumbnails(config: &Config) -> Result {
+	if config.media_thumbnail_max_pixels == 0 {
+		return Err!(Config(
+			"media_thumbnail_max_pixels",
+			"A pixel budget of zero refuses every picture; remove the setting to take the \
+			 default."
+		));
+	}
+
+	Ok(())
+}
+
+/// Beyond this the semaphore sizing the extractions would itself be rejected,
+/// and no host has a use for that much video decoding at once.
+const MAX_VIDEO_THUMBNAIL_CONCURRENCY: usize = 1024;
+
+fn check_video_thumbnails(config: &Config) -> Result {
+	if !(1..=MAX_VIDEO_THUMBNAIL_CONCURRENCY).contains(&config.media_video_thumbnail_concurrency)
+	{
+		return Err!(Config(
+			"media_video_thumbnail_concurrency",
+			"Video thumbnail programs permitted at once must be between 1 and \
+			 {MAX_VIDEO_THUMBNAIL_CONCURRENCY}: zero leaves every extraction waiting for a slot \
+			 that never frees, and the ceiling is far past any useful degree of parallelism."
+		));
+	}
+
+	if config.media_video_thumbnail_timeout == 0 {
+		return Err!(Config(
+			"media_video_thumbnail_timeout",
+			"A video thumbnail deadline of zero expires before the program can start."
+		));
 	}
 
 	Ok(())
@@ -393,6 +445,18 @@ fn check_url_previews(config: &Config) -> Result {
 		));
 	}
 
+	if let Some(user_agent) = config.url_preview_user_agent.as_deref()
+		&& HeaderValue::from_str(user_agent).is_err()
+	{
+		return Err!(Config("url_preview_user_agent", "Not a valid HTTP header value."));
+	}
+
+	if let Some(user_agent) = config.url_preview_media_user_agent.as_deref()
+		&& HeaderValue::from_str(user_agent).is_err()
+	{
+		return Err!(Config("url_preview_media_user_agent", "Not a valid HTTP header value."));
+	}
+
 	Ok(())
 }
 
@@ -402,6 +466,17 @@ fn check_room_version(config: &Config) -> Result {
 			"default_room_version",
 			"Room version {:?} is not available",
 			config.default_room_version
+		));
+	}
+
+	if config
+		.default_power_level_content_override
+		.as_ref()
+		.is_some_and(|value| !value.is_object())
+	{
+		return Err!(Config(
+			"default_power_level_content_override",
+			"must be a table (a JSON object)"
 		));
 	}
 
@@ -451,6 +526,44 @@ fn check_identity_providers(config: &Config) -> Result {
 			 To prevent this warning set `default = true` for one provider. Considering \
 			 {default} the default for now..."
 		);
+	}
+
+	let mas_active = config
+		.mas_secret
+		.as_deref()
+		.is_some_and(|secret| !secret.is_empty());
+
+	if mas_active
+		&& !config
+			.identity_provider
+			.values()
+			.any(|provider| provider.brand == "mas")
+	{
+		warn!(
+			"mas_secret is set but no identity_provider is configured with `brand = MAS`. \
+			 Tuwunel is its own OpenID Connect issuer and does not delegate authentication to \
+			 MAS; the secret only authorizes MAS provisioning calls on `/_synapse/mas/`. \
+			 Logging in through MAS additionally requires an identity_provider entry with \
+			 `brand = MAS`."
+		);
+	}
+
+	if mas_active {
+		config
+			.identity_provider
+			.values()
+			.filter(|provider| provider.brand == "mas" && !provider.trusted)
+			.for_each(|provider| {
+				warn!(
+					provider = provider.id(),
+					"`mas_secret` is set and this MAS identity provider is configured without \
+					 `trusted = true`. Existing accounts provisioned by MAS will not be matched \
+					 automatically during SSO login, so users may receive separate accounts. \
+					 Set `trusted = true` only when this identity provider is the same \
+					 self-hosted MAS instance that provisions this server and you fully control \
+					 it; otherwise associate users explicitly."
+				);
+			});
 	}
 
 	Ok(())

@@ -1,3 +1,4 @@
+use futures::pin_mut;
 use ruma::{
 	EventId, RoomId, UserId,
 	events::{
@@ -13,6 +14,7 @@ use tuwunel_core::{
 	Err, Result, implement,
 	matrix::{Event, StateKey},
 	pdu::PduBuilder,
+	utils::FutureBoolExt,
 };
 
 use crate::rooms::state::RoomMutexGuard;
@@ -163,6 +165,25 @@ pub async fn user_can_see_state_events(&self, user_id: &UserId, room_id: &RoomId
 
 		| _ => false,
 	}
+}
+
+/// Whether a user may see a room: a current or prior membership (joined,
+/// invited, left), or a world-readable room. Forgetting a room clears the
+/// user's left-state, so a forgotten room is not visible.
+#[implement(super::Service)]
+pub async fn user_can_see_room(&self, user_id: &UserId, room_id: &RoomId) -> bool {
+	let state_cache = &self.services.state_cache;
+	let joined = state_cache.is_joined(user_id, room_id);
+	let invited = state_cache.is_invited(user_id, room_id);
+	let left = state_cache.is_left(user_id, room_id);
+	let world_readable = self.is_world_readable(room_id);
+
+	pin_mut!(joined, invited, left, world_readable);
+	joined
+		.or(invited)
+		.or(left)
+		.or(world_readable)
+		.await
 }
 
 #[implement(super::Service)]

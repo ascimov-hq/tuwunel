@@ -9,6 +9,7 @@ use bytes::{Bytes, BytesMut};
 use ipaddress::{IPAddress, ipv4::from_u32 as ipv4_from_u32};
 use reqwest::{Certificate, Client, ClientBuilder, dns::Resolve, header::HeaderValue, redirect};
 use tuwunel_core::{Config, Err, Result, debug, either::Either, err, implement, trace};
+use webpki_root_certs::TLS_SERVER_ROOT_CERTS;
 
 use crate::{Services, resolver::Validating, service};
 
@@ -17,6 +18,7 @@ type DisableEncoding = fn(ClientBuilder) -> ClientBuilder;
 pub struct Clients {
 	pub default: Client,
 	pub url_preview: Client,
+	pub url_preview_media: Client,
 	pub extern_media: Client,
 	pub well_known: Client,
 	pub federation: Client,
@@ -79,24 +81,27 @@ fn make_clients(services: &Services) -> Result<Clients> {
 	Ok(Clients {
 		default: with!(cb => cb.dns_resolver(Arc::clone(&services.resolver.resolver))),
 
-		url_preview: with!("preview", cb => {
-			let interface = &services
+		url_preview: with!("preview", cb => preview_builder(
+			services,
+			cb,
+			services
 				.config
-				.url_preview_bound_interface;
+				.url_preview_user_agent
+				.as_deref(),
+		)?),
 
-			let bind_addr = interface.clone().and_then(Either::left);
-			let bind_iface = interface.clone().and_then(Either::right);
-
-			let resolver = Validating::new(
-				Arc::clone(&services.resolver.resolver),
-				Arc::clone(&services.client.cidr_range_denylist),
-			);
-
-			builder_interface(cb, bind_iface.as_deref())?
-				.local_address(bind_addr)
-				.dns_resolver(resolver)
-				.redirect(redirect::Policy::limited(3))
-		}),
+		url_preview_media: with!("preview", cb => preview_builder(
+			services,
+			cb,
+			services
+				.config
+				.url_preview_media_user_agent
+				.as_deref()
+				.or(services
+					.config
+					.url_preview_user_agent
+					.as_deref()),
+		)?),
 
 		extern_media: with!(cb => cb
 			.dns_resolver(Validating::new(
@@ -169,11 +174,44 @@ fn make_clients(services: &Services) -> Result<Clients> {
 	})
 }
 
+/// Shared construction for the URL preview clients: bound to the configured
+/// interface, resolving through the CIDR-validating resolver, with an
+/// optional User-Agent override.
+fn preview_builder(
+	services: &Services,
+	builder: ClientBuilder,
+	user_agent: Option<&str>,
+) -> Result<ClientBuilder> {
+	let interface = &services.config.url_preview_bound_interface;
+
+	let bind_addr = interface.clone().and_then(Either::left);
+	let bind_iface = interface.clone().and_then(Either::right);
+
+	let resolver = Validating::new(
+		Arc::clone(&services.resolver.resolver),
+		Arc::clone(&services.client.cidr_range_denylist),
+	);
+
+	let builder = match user_agent {
+		| Some(user_agent) => builder.user_agent(user_agent),
+		| None => builder,
+	};
+
+	Ok(builder_interface(builder, bind_iface.as_deref())?
+		.local_address(bind_addr)
+		.dns_resolver(resolver)
+		.redirect(redirect::Policy::limited(3)))
+}
+
 fn base(config: &Config, name: Option<&str>) -> Result<ClientBuilder> {
 	let user_agent = tuwunel_core::version::user_agent();
 	let user_agent: HeaderValue = name
 		.map(|name| format!("{user_agent} {name}").try_into())
 		.unwrap_or_else(|| user_agent.try_into())?;
+
+	let certs = TLS_SERVER_ROOT_CERTS
+		.iter()
+		.map(|der| Certificate::from_der(der).expect("certificate must be valid der encoding"));
 
 	let builder = Client::builder()
 		.connect_timeout(Duration::from_secs(config.request_conn_timeout))
@@ -184,16 +222,17 @@ fn base(config: &Config, name: Option<&str>) -> Result<ClientBuilder> {
 		.user_agent(user_agent)
 		.redirect(redirect::Policy::limited(6))
 		.danger_accept_invalid_certs(config.allow_invalid_tls_certificates)
-		.tls_certs_merge(
-			webpki_root_certs::TLS_SERVER_ROOT_CERTS
-				.iter()
-				.map(|der| {
-					Certificate::from_der(der).expect("certificate must be valid der encoding")
-				}),
-		)
 		.connection_verbose(cfg!(debug_assertions))
 		// Check if env var is set to avoid locking the keyfile mutex on every connection open
 		.tls_sslkeylogfile(std::env::var_os("SSLKEYLOGFILE").is_some());
+
+	// Android's trust-store verifier requires a JVM; certs-only keeps rustls
+	// on the bundled roots.
+	#[cfg(target_os = "android")]
+	let builder = builder.tls_certs_only(certs);
+
+	#[cfg(not(target_os = "android"))]
+	let builder = builder.tls_certs_merge(certs);
 
 	let encodings: [(bool, DisableEncoding); 3] = [
 		(config.request_gzip, ClientBuilder::no_gzip),
@@ -212,10 +251,11 @@ fn base(config: &Config, name: Option<&str>) -> Result<ClientBuilder> {
 	}
 }
 
-/// Buffer a remote response body, rejecting any response larger than `limit`
-/// bytes. reqwest enforces no response-size limit, so an unbounded `bytes()`
-/// lets a peer drive an allocator abort; refuse an oversized advertised length
-/// and hold the same bound while streaming for when that length is absent.
+/// Prevents a remote peer from forcing unbounded response-body allocation.
+///
+/// An advertised `Content-Length` above `limit` is rejected before the body
+/// buffer is allocated. The streaming loop enforces the same bound when the
+/// length is absent or inaccurate.
 pub async fn read_response_capped(
 	mut response: reqwest::Response,
 	limit: usize,
@@ -263,11 +303,15 @@ fn builder_interface(builder: ClientBuilder, config: Option<&str>) -> Result<Cli
 fn builder_interface(builder: ClientBuilder, config: Option<&str>) -> Result<ClientBuilder> {
 	use tuwunel_core::Err;
 
-	if let Some(iface) = config {
-		Err!("Binding to network-interface {iface:?} by name is not supported on this platform.")
-	} else {
-		Ok(builder)
-	}
+	config.map_or_else(
+		|| Ok(builder),
+		|iface| {
+			Err!(
+				"Binding to network-interface {iface:?} by name is not supported on this \
+				 platform."
+			)
+		},
+	)
 }
 
 fn appservice_resolver(services: &Services) -> Arc<dyn Resolve> {

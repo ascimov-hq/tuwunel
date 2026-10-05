@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use futures::StreamExt;
+use futures::{StreamExt, future::join3};
 use ruma::{
 	OwnedServerName, RoomId, UserId,
 	events::{
@@ -43,6 +43,15 @@ pub async fn update_membership(
 	count: PduCount,
 ) -> Result {
 	let membership = membership_event.membership;
+
+	// With `incremental_joined_count`, remember the user's membership before
+	// this update so the room's counters can be adjusted by the difference
+	// instead of being recounted from every member.
+	let previous = if update_joined_count && self.services.config.incremental_joined_count {
+		Some(self.membership_flags(user_id, room_id).await)
+	} else {
+		None
+	};
 
 	// Keep track what remote users exist by adding them as "deactivated" users
 	//
@@ -159,10 +168,116 @@ pub async fn update_membership(
 	}
 
 	if update_joined_count {
-		self.update_joined_count(room_id).await;
+		match previous {
+			| Some(previous) =>
+				self.update_joined_count_incremental(room_id, user_id, previous)
+					.await,
+			| None => self.update_joined_count(room_id).await,
+		}
 	}
 
 	Ok(())
+}
+
+/// A user's membership in a room as recorded by the `mark_as_*` indexes.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct MembershipFlags {
+	joined: bool,
+	invited: bool,
+	knocked: bool,
+}
+
+#[implement(super::Service)]
+async fn membership_flags(&self, user_id: &UserId, room_id: &RoomId) -> MembershipFlags {
+	let (joined, invited, knocked) = join3(
+		self.is_joined(user_id, room_id),
+		self.is_invited(user_id, room_id),
+		self.is_knocked(user_id, room_id),
+	)
+	.await;
+
+	MembershipFlags { joined, invited, knocked }
+}
+
+/// Incremental variant of [`Self::update_joined_count`] for a single user's
+/// membership change: point lookups and +-1 on the stored counters instead of
+/// rescanning every joined, invited and knocked member (O(1) instead of O(N)
+/// per member event; O(N^2) to fill a room). Servers are only (un)recorded
+/// when the user's server gains its first or loses its last joined member.
+/// Falls back to the full recount when the room has no stored counters yet.
+#[implement(super::Service)]
+#[tracing::instrument(level = "debug", skip(self))]
+async fn update_joined_count_incremental(
+	&self,
+	room_id: &RoomId,
+	user_id: &UserId,
+	previous: MembershipFlags,
+) {
+	let current = self.membership_flags(user_id, room_id).await;
+
+	let (joinedcount, invitedcount, knockedcount) = join3(
+		self.room_joined_count(room_id),
+		self.room_invited_count(room_id),
+		self.room_knocked_count(room_id),
+	)
+	.await;
+
+	let (Ok(joinedcount), Ok(invitedcount), Ok(knockedcount)) =
+		(joinedcount, invitedcount, knockedcount)
+	else {
+		self.update_joined_count(room_id).await;
+		return;
+	};
+
+	let adjust = |count: u64, was: bool, is: bool| match (was, is) {
+		| (false, true) => count.saturating_add(1),
+		| (true, false) => count.saturating_sub(1),
+		| _ => count,
+	};
+
+	if previous.joined != current.joined {
+		self.db
+			.roomid_joinedcount
+			.raw_put(room_id, adjust(joinedcount, previous.joined, current.joined));
+	}
+
+	if previous.invited != current.invited {
+		self.db
+			.roomid_invitedcount
+			.raw_put(room_id, adjust(invitedcount, previous.invited, current.invited));
+	}
+
+	if previous.knocked != current.knocked {
+		self.db
+			.roomid_knockedcount
+			.raw_put(room_id, adjust(knockedcount, previous.knocked, current.knocked));
+	}
+
+	let server = user_id.server_name();
+	let roomserver_id = (room_id, server);
+	let serverroom_id = (server, room_id);
+	match (previous.joined, current.joined) {
+		| (false, true) =>
+			if !self.server_in_room(server, room_id).await {
+				self.db.roomserverids.put_raw(roomserver_id, []);
+				self.db.serverroomids.put_raw(serverroom_id, []);
+			},
+		| (true, false) =>
+			if !self
+				.room_members(room_id)
+				.ready_any(|member| member.server_name() == server)
+				.await
+			{
+				self.db.roomserverids.del(roomserver_id);
+				self.db.serverroomids.del(serverroom_id);
+			},
+		| _ => {},
+	}
+
+	self.appservice_in_room_cache
+		.write()
+		.expect("locked")
+		.remove(room_id);
 }
 
 #[implement(super::Service)]

@@ -28,6 +28,10 @@ Tuwunel supports setting individual config options in TOML format from the
 `-O` / `--option` flag. For example, you can set your server name via `-O
 server_name=\"example.com\"`.
 
+One setting is refused here, as it is from configuration files and the
+environment: `database_restore_backup` belongs to `--restore-backup` alone,
+since restoring a backup is destructive and must not repeat.
+
 Note that the config is parsed as TOML, and shells like bash will remove quotes.
 So unfortunately it is required to escape quotes if the config option takes a
 string. This does not apply to options that take booleans or numbers:

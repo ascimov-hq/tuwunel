@@ -13,7 +13,7 @@ use tuwunel_core::{
 		stream::{TryIgnore, WidebandExt},
 	},
 };
-use tuwunel_database::{Interfix, Map, keyval::Val};
+use tuwunel_database::{Map, Txn, keyval::Val};
 
 use crate::rooms::{
 	short::ShortRoomId,
@@ -57,19 +57,16 @@ impl crate::Service for Service {
 
 #[implement(Service)]
 pub fn index_pdu(&self, shortroomid: ShortRoomId, pdu_id: &RawPduId, message_body: &str) {
-	let batch = tokenize(message_body)
-		.map(|word| {
-			let mut key = shortroomid.to_be_bytes().to_vec();
-			key.extend_from_slice(word.as_bytes());
-			key.push(0xFF);
-			key.extend_from_slice(pdu_id.as_ref()); // TODO: currently we save the room id a second time here
-			key
-		})
-		.collect::<Vec<_>>();
+	let items = tokenize(message_body).map(|word| {
+		let mut key = shortroomid.to_be_bytes().to_vec();
+		key.extend_from_slice(word.as_bytes());
+		key.push(0xFF);
+		key.extend_from_slice(pdu_id.as_ref()); // TODO: currently we save the room id a second time here
 
-	self.db
-		.tokenids
-		.insert_batch(batch.iter().map(|k| (k.as_slice(), &[])));
+		(key, [])
+	});
+
+	Txn::insert(&self.db.tokenids, items).execute();
 }
 
 #[implement(Service)]
@@ -196,17 +193,23 @@ fn search_pdu_ids_query_word(
 
 #[implement(Service)]
 pub async fn delete_all_search_tokenids_for_room(&self, room_id: &RoomId) -> Result {
-	let prefix = (room_id, Interfix);
+	let Ok(shortroomid) = self.services.short.get_shortroomid(room_id).await else {
+		return Ok(());
+	};
 
-	self.db
+	let txn = self
+		.db
 		.tokenids
-		.keys_prefix_raw(&prefix)
+		.keys_prefix_raw(&shortroomid)
 		.ignore_err()
-		.ready_for_each(|key| {
+		.ready_fold(self.services.db.txn(), |mut txn, key| {
 			trace!("Removing key: {key:?}");
-			self.db.tokenids.remove(key);
+			txn.del_raw(&self.db.tokenids, key);
+			txn
 		})
 		.await;
+
+	txn.execute();
 
 	Ok(())
 }

@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use ruma::{
 	OwnedRoomId, UserId,
 	events::{StateEventType, room::power_levels::RoomPowerLevelsEventContent},
+	profile::ProfileFieldName,
 };
-use tuwunel_core::{Event, Result, info, pdu::PduBuilder, utils::ReadyExt, warn};
+use tuwunel_core::{Event, Result, info, pdu::PduBuilder, warn};
 
-use crate::users::Propagation;
+use crate::profile::Propagation;
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
@@ -38,31 +39,26 @@ impl Service {
 			.deactivate_account(user_id)
 			.await?;
 
+		self.services
+			.profile
+			.clear_profile_keys(user_id)
+			.await;
+
+		self.services
+			.profile
+			.update_all_rooms(
+				user_id,
+				&[(ProfileFieldName::DisplayName, None), (ProfileFieldName::AvatarUrl, None)],
+				Propagation::All,
+			)
+			.await;
+
 		let all_joined_rooms: Vec<OwnedRoomId> = self
 			.services
 			.state_cache
 			.rooms_joined(user_id)
 			.map(Into::into)
 			.collect()
-			.await;
-
-		self.services
-			.users
-			.update_displayname(user_id, None, &all_joined_rooms, Propagation::All)
-			.await;
-		self.services
-			.users
-			.update_avatar_url(user_id, None, None, &all_joined_rooms, Propagation::All)
-			.await;
-
-		self.services
-			.users
-			.all_profile_keys(user_id)
-			.ready_for_each(|(profile_key, _)| {
-				self.services
-					.users
-					.set_profile_key(user_id, &profile_key, None);
-			})
 			.await;
 
 		for room_id in all_joined_rooms {
@@ -143,8 +139,11 @@ impl Service {
 			.collect()
 			.await;
 
-		// MSC4025: erase non-event data when the user requested it.
+		// MSC4025: erase non-event data when the user requested it, and mark
+		// the user so their events serve as pruned copies (phase B).
 		if erase {
+			self.services.users.set_erased(user_id);
+
 			self.services
 				.account_data
 				.erase_user(user_id, None)
@@ -174,7 +173,6 @@ impl Service {
 				.services
 				.membership
 				.leave(user_id, &room_id, None, false, &state_lock)
-				.boxed()
 				.await
 			{
 				warn!(%user_id, "Failed to leave {room_id} remotely: {e}");

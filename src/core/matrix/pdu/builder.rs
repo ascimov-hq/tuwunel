@@ -9,6 +9,23 @@ use serde_json::value::{RawValue as RawJsonValue, to_raw_value};
 
 use super::{Content, StateKey};
 
+tokio::task_local! {
+	/// Set while appending events which must not notify anyone, e.g. history
+	/// sent through `com.beeper.batch_sending` with `send_notification: false`.
+	/// The pusher then skips push-rule evaluation, notification counts and
+	/// pushes for those events. Unset means notify as usual.
+	pub static SUPPRESS_NOTIFICATIONS: bool;
+}
+
+/// Whether the current task is appending events under
+/// [`SUPPRESS_NOTIFICATIONS`].
+#[must_use]
+pub fn notifications_suppressed() -> bool {
+	SUPPRESS_NOTIFICATIONS
+		.try_with(|suppressed| *suppressed)
+		.unwrap_or(false)
+}
+
 /// Build the start of a PDU in order to add it to the Database.
 #[derive(Deserialize)]
 pub struct Builder {

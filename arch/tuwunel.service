@@ -9,6 +9,9 @@ RequiresMountsFor=/var/lib/private/tuwunel
 DynamicUser=yes
 Type=notify-reload
 ReloadSignal=SIGUSR1
+# Refreshes any credentials the operator adds before the reload signal is sent.
+# Absent from the Debian and Red Hat units, whose systemd predates it.
+RefreshOnReload=yes
 WatchdogSec=30
 
 TTYPath=/dev/tty25
@@ -55,6 +58,9 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service @resources
 SystemCallFilter=~@clock @debug @module @mount @reboot @swap @cpu-emulation @obsolete @timer @chown @setuid @privileged @keyring @ipc
+# Restore the pipe syscalls subtracted with @ipc above: a configured
+# media_video_thumbnail_command is spawned with pipes.
+SystemCallFilter=pipe pipe2
 SystemCallErrorNumber=EPERM
 StateDirectory=tuwunel
 
@@ -72,7 +78,7 @@ Restart=on-failure
 RestartSec=5
 
 TimeoutStopSec=4m
-TimeoutStartSec=4m
+TimeoutStartSec=5m
 
 StartLimitInterval=1m
 StartLimitBurst=5

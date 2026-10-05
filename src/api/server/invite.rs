@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use axum::extract::State;
 use base64::{Engine as _, engine::general_purpose};
 use futures::StreamExt;
@@ -5,7 +7,7 @@ use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedRoomId, OwnedUserId, RoomId, RoomVersionId,
 	ServerName, UserId,
 	api::{
-		appservice::event::push_events,
+		appservice::event::push_events::{self, v1::DeviceLists},
 		error::{ErrorKind, IncompatibleRoomVersionErrorData},
 		federation::membership::create_invite,
 	},
@@ -41,6 +43,11 @@ pub(crate) async fn create_invite_route(
 	ClientIp(client): ClientIp,
 	body: Ruma<create_invite::v2::Request>,
 ) -> Result<create_invite::v2::Response> {
+	services
+		.sending
+		.notify_peer_alive(body.origin())
+		.await;
+
 	validate_request(&services, &body).await?;
 
 	enforce_stripped_state(&services, &body).await?;
@@ -252,10 +259,6 @@ fn validate_origins<'a>(
 		return Err!(Request(Forbidden("Can only send invites on behalf of your users.")));
 	}
 
-	if origin.is_some_and(|origin| origin != sender.server_name()) {
-		return Err!(Request(Forbidden("Your users can only be from your origin.")));
-	}
-
 	if origin.is_some_and(|origin| origin != body_origin) {
 		return Err!(Request(Forbidden("Can only send events from your origin.")));
 	}
@@ -353,8 +356,14 @@ async fn record_local_invite(
 						.into(),
 					ephemeral: Vec::new(),
 					to_device: Vec::new(),
+					device_lists: DeviceLists::new(),
+					device_one_time_keys_count: BTreeMap::new(),
+					device_unused_fallback_key_types: BTreeMap::new(),
 				})
-				.await?;
+				.await
+				.map_err(|_| {
+					err!(BadServerResponse("Failed to notify appservice about incoming invite."))
+				})?;
 		}
 	}
 

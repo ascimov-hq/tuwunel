@@ -1,7 +1,10 @@
 #![cfg(test)]
 
 use ruma::{RoomId, UserId};
+use tuwunel_core::matrix::pdu::PduCount;
 use tuwunel_database::{Interfix, SEP, serialize_to_vec};
+
+use super::data::position_advances;
 
 const ROOM: &str = "!room:example.com";
 const USER: &str = "@user:example.com";
@@ -98,6 +101,25 @@ fn legacy_match_does_not_collide_with_kind_tails() {
 	assert!(!new_key(THREAD_ROOT).ends_with(user_bytes));
 	assert!(!new_key("").ends_with(user_bytes), "empty kind ends with SEP, not user_id");
 	assert!(legacy_key().ends_with(user_bytes));
+}
+
+/// Position comparison behind the public receipt gate.
+///
+/// A stored position of `None` means no row was found. A position of `None`
+/// after resolution means the event is not in this server's timeline.
+#[test]
+fn position_advance_matrix() {
+	let normal = |count| Some(PduCount::Normal(count));
+	let backfilled = |count| Some(PduCount::Backfilled(count));
+
+	assert!(position_advances(None, normal(1)), "absent stored position accepts");
+	assert!(position_advances(None, None), "neither position resolved accepts");
+	assert!(position_advances(normal(2), None), "unresolvable incoming accepts");
+	assert!(position_advances(normal(1), normal(2)), "strictly greater advances");
+	assert!(!position_advances(normal(2), normal(2)), "equal position rejects");
+	assert!(!position_advances(normal(3), normal(2)), "lower position rejects");
+	assert!(position_advances(backfilled(-1), normal(1)), "normal advances past backfilled");
+	assert!(!position_advances(normal(1), backfilled(-1)), "backfilled sorts below normal");
 }
 
 /// MSC3771 per-thread `m.read.private` storage. `roomuserid_privateread`

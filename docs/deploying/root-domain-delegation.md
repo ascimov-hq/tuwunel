@@ -92,7 +92,7 @@ At a minimum, the following JSON files should be created:
 
 ### Option 2: Reverse proxy
 
-These are example configurations if `example.com` is reverse-proxied behind Nginx or Caddy.
+These are example configurations if `example.com` is reverse-proxied behind Nginx, Caddy or Traefik.
 
 > [!NOTE]  
 > Replace `tuwunel` with the URL where tuwunel is listening; this may look like `127.0.0.1:8008`, `matrix.example.com`, or `tuwunel` if you declared an `upstream tuwunel` block.
@@ -130,6 +130,27 @@ server {
   ~
   ~# The remainder of your nginx configuration for example.com including SSL termination, other locations, etc.
 }
+```
+
+#### Traefik
+
+Change Tuwunel's router rule to:
+
+```
+Host(`matrix.example.com`) || Host(`example.com`) && PathPrefix(`/.well-known/matrix`)
+```
+
+##### Labels example
+
+```yaml
+- "traefik.http.routers.tuwunel.rule=Host(`matrix.example.com`) || Host(`example.com`) && PathPrefix(`/.well-known/matrix`)"
+- "traefik.http.routers.tuwunel-secure.rule=Host(`matrix.example.com`) || Host(`example.com`) && PathPrefix(`/.well-known/matrix`)"
+```
+
+##### File example
+
+```yaml
+rule: "Host(`matrix.example.com`) || Host(`example.com`) && PathPrefix(`/.well-known/matrix`)"
 ```
 
 ## Testing

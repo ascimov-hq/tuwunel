@@ -3,8 +3,8 @@
 //! Pairs with the HTTP handlers in `tuwunel_api::client::admin` that serve
 //! `/_synapse/admin/v1/register`. Owns:
 //!
-//! 1. the resolved shared secret (from `registration_shared_secret` or its
-//!    `_file` companion);
+//! 1. resolution of the shared secret (from `registration_shared_secret` or its
+//!    `_file` companion), performed at each use;
 //! 2. a short-lived in-memory nonce store with a 60-second TTL.
 //!
 //! The nonce store lives in RAM rather than RocksDB on purpose: each entry's
@@ -13,11 +13,13 @@
 
 use std::{
 	collections::BTreeMap,
-	fs,
 	time::{Duration, Instant},
 };
 
-use tuwunel_core::{Config, error, implement, utils};
+use tuwunel_core::{
+	implement,
+	utils::{self, Secret, is_secret_set, resolve_secret},
+};
 
 type Nonces = BTreeMap<String, Instant>;
 
@@ -56,30 +58,29 @@ pub fn consume_register_nonce(&self, nonce: &str) -> bool {
 		.is_some_and(|issued| issued.elapsed() < NONCE_TTL)
 }
 
+/// Answered without opening the secret file, since the nonce endpoint this
+/// gates takes no authentication and is not rate limited.
 #[implement(super::Service)]
-#[inline]
-pub fn register_shared_secret(&self) -> Option<&str> { self.register_shared_secret.as_deref() }
+pub fn register_is_enabled(&self) -> bool {
+	let config = &self.services.server.config;
 
+	is_secret_set(
+		config.registration_shared_secret_file.as_deref(),
+		config.registration_shared_secret.as_deref(),
+	)
+}
+
+/// Reads `registration_shared_secret_file` on every call, so a rotated secret
+/// takes effect without a restart.
 #[implement(super::Service)]
-#[inline]
-pub fn register_is_enabled(&self) -> bool { self.register_shared_secret.is_some() }
+pub fn register_shared_secret(&self) -> Option<Secret> {
+	let config = &self.services.server.config;
 
-pub(super) fn resolve_shared_secret(config: &Config) -> Option<String> {
-	config
-		.registration_shared_secret_file
-		.as_ref()
-		.and_then(|path| {
-			fs::read_to_string(path)
-				.inspect_err(|e| {
-					error!("Failed to read the registration shared secret file: {e}");
-				})
-				.ok()
-				.as_deref()
-				.map(str::trim)
-				.map(ToOwned::to_owned)
-		})
-		.or_else(|| config.registration_shared_secret.clone())
-		.filter(|s| !s.is_empty())
+	resolve_secret(
+		config.registration_shared_secret_file.as_deref(),
+		config.registration_shared_secret.as_deref(),
+		"registration shared secret",
+	)
 }
 
 fn drop_oldest(nonces: &mut Nonces) {

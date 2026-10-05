@@ -2,10 +2,10 @@ use std::cmp::{self, Ordering};
 
 use futures::{FutureExt, StreamExt};
 use ruma::{
-	MilliSecondsSinceUnixEpoch, MxcUri, OwnedRoomId, OwnedUserId, RoomId, UserId,
+	MilliSecondsSinceUnixEpoch, MxcUri, OwnedRoomId, RoomId, UserId,
 	events::room::member::MembershipState,
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::IgnoredAny};
 use tuwunel_core::{
 	Err, Result, debug, debug_info, debug_warn, err, info,
 	itertools::Itertools,
@@ -13,12 +13,12 @@ use tuwunel_core::{
 	result::NotFound,
 	utils,
 	utils::{
-		BoolExt, IterStream, ReadyExt,
-		stream::{TryExpect, TryIgnore},
+		BoolExt, ReadyExt,
+		stream::{BroadbandExt, TryExpect, TryIgnore},
 	},
 	warn,
 };
-use tuwunel_database::{Deserialized, SEP};
+use tuwunel_database::{Deserialized, Json, SEP};
 
 use crate::{Services, media, rooms::timeline::bias_count};
 
@@ -163,6 +163,10 @@ async fn fresh(services: &Services) -> Result {
 	db["global"].insert(b"upgrade_legacy_mediaid_user", []);
 	db["global"].insert(b"remove_remote_media_userid", []);
 	db["global"].insert(b"rebuild_roomid_tscount_pducount", []);
+	db["global"].insert(b"rebuild_relatesto_typed", []);
+	db["global"].insert(b"migrate_profile_keys_to_useridprofilekey", []);
+	db["global"].insert(b"rebuild_thread_activity", []);
+	db["global"].insert(b"clear_servername_status", []);
 
 	// Create the admin room and server user on first run
 	if services.config.create_admin_room {
@@ -177,6 +181,7 @@ async fn fresh(services: &Services) -> Result {
 }
 
 /// Apply any migrations
+#[expect(clippy::too_many_lines)]
 async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 	let db = &services.db;
 
@@ -209,6 +214,16 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 
 	import_conduit_knocks(services).await?;
 	split_conduit_highlight_counts(services).await?;
+
+	// The next two repairs fix a conduwuit-era roomuserid_joined bug Conduit
+	// never had; record them done for a Conduit database instead of running.
+	if db
+		.open_cf("servernamemediaid_metadata")?
+		.is_some()
+	{
+		db["global"].insert(b"fix_bad_double_separator_in_state_cache", []);
+		db["global"].insert(b"retroactively_fix_bad_data_from_roomuserid_joined", []);
+	}
 
 	if db["global"]
 		.get(b"fix_bad_double_separator_in_state_cache")
@@ -272,6 +287,45 @@ async fn migrate(services: &Services, foreign_lineage: bool) -> Result {
 		.is_not_found()
 	{
 		rebuild_roomid_tscount_pducount(services).await?;
+	}
+
+	if db["global"]
+		.get(b"rebuild_relatesto_typed")
+		.await
+		.is_not_found()
+	{
+		services
+			.pdu_metadata
+			.rebuild_typed_relations()
+			.await?;
+
+		db["global"].insert(b"rebuild_relatesto_typed", []);
+	}
+
+	if db["global"]
+		.get(b"migrate_profile_keys_to_useridprofilekey")
+		.await
+		.is_not_found()
+	{
+		migrate_profile_keys(services).await?;
+	}
+
+	if db["global"]
+		.get(b"rebuild_thread_activity")
+		.await
+		.is_not_found()
+	{
+		services.threads.rebuild_thread_activity().await?;
+
+		db["global"].insert(b"rebuild_thread_activity", []);
+	}
+
+	if db["global"]
+		.get(b"clear_servername_status")
+		.await
+		.is_not_found()
+	{
+		clear_servername_status(services).await?;
 	}
 
 	// Non-destructive and idempotent, so it runs every boot rather than once: a
@@ -481,79 +535,50 @@ async fn retroactively_fix_bad_data_from_roomuserid_joined(services: &Services) 
 	let db = &services.db;
 	let _cork = db.cork_and_sync();
 
-	let room_ids = services
+	services
 		.metadata
 		.iter_ids()
-		.map(ToOwned::to_owned)
-		.collect::<Vec<_>>()
+		.for_each(async |room_id| {
+			debug_info!(%room_id, "Fixing room");
+
+			services
+				.state_cache
+				.room_members(room_id)
+				.map(ToOwned::to_owned)
+				.broad_filter_map(async |user_id| {
+					// A member with no resolved member event is left untouched.
+					let member = services
+						.state_accessor
+						.get_member(room_id, &user_id)
+						.await
+						.ok()?;
+
+					Some((user_id, member.membership))
+				})
+				.ready_for_each(|(user_id, membership)| {
+					let count = services.globals.next_count();
+
+					match membership {
+						| MembershipState::Join => services.state_cache.mark_as_joined(
+							&user_id,
+							room_id,
+							PduCount::Normal(*count),
+						),
+						| _ => services.state_cache.mark_as_left(
+							&user_id,
+							room_id,
+							PduCount::Normal(*count),
+						),
+					}
+				})
+				.await;
+
+			services
+				.state_cache
+				.update_joined_count(room_id)
+				.await;
+		})
 		.await;
-
-	for room_id in &room_ids {
-		debug_info!("Fixing room {room_id}");
-
-		let users_in_room: Vec<OwnedUserId> = services
-			.state_cache
-			.room_members(room_id)
-			.map(ToOwned::to_owned)
-			.collect()
-			.await;
-
-		let joined_members = users_in_room
-			.iter()
-			.stream()
-			.filter(|user_id| {
-				services
-					.state_accessor
-					.get_member(room_id, user_id)
-					.map(|member| {
-						member.is_ok_and(|member| member.membership == MembershipState::Join)
-					})
-			})
-			.collect::<Vec<_>>()
-			.await;
-
-		let non_joined_members = users_in_room
-			.iter()
-			.stream()
-			.filter(|user_id| {
-				services
-					.state_accessor
-					.get_member(room_id, user_id)
-					.map(|member| {
-						member.is_ok_and(|member| member.membership != MembershipState::Join)
-					})
-			})
-			.collect::<Vec<_>>()
-			.await;
-
-		for user_id in &joined_members {
-			debug_info!("User is joined, marking as joined");
-			let count = services.globals.next_count();
-			services
-				.state_cache
-				.mark_as_joined(user_id, room_id, PduCount::Normal(*count));
-		}
-
-		for user_id in &non_joined_members {
-			debug_info!("User is left or banned, marking as left");
-			let count = services.globals.next_count();
-			services
-				.state_cache
-				.mark_as_left(user_id, room_id, PduCount::Normal(*count));
-		}
-	}
-
-	for room_id in &room_ids {
-		debug_info!(
-			"Updating joined count for room {room_id} to fix servers in room after correcting \
-			 membership states"
-		);
-
-		services
-			.state_cache
-			.update_joined_count(room_id)
-			.await;
-	}
 
 	db.engine.sort()?;
 	db["global"].insert(b"retroactively_fix_bad_data_from_roomuserid_joined", []);
@@ -859,5 +884,100 @@ async fn rebuild_roomid_tscount_pducount(services: &Services) -> Result {
 	info!(%count, "Rebuilt roomid_tscount_pducount index");
 
 	db["global"].insert(b"rebuild_roomid_tscount_pducount", []);
+	db.engine.sort()
+}
+
+/// Relocates the per-user displayname and avatar_url out of their dedicated
+/// columns into the unified useridprofilekey_value store keyed by MSC4133 field
+/// name, where the profile service now reads them. The dedicated columns are
+/// left intact, so an older binary opening the same database still resolves.
+async fn migrate_profile_keys(services: &Services) -> Result {
+	use ruma::profile::ProfileFieldName;
+
+	let db = &services.db;
+	let cork = db.cork_and_sync();
+
+	let userid_displayname = db["userid_displayname"].clone();
+	let userid_avatarurl = db["userid_avatarurl"].clone();
+	let userid_blurhash = db["userid_blurhash"].clone();
+	let useridprofilekey_value = db["useridprofilekey_value"].clone();
+
+	warn!(
+		"Relocating displaynames, avatar_urls and blurhashes into the unified profile-key store"
+	);
+
+	let displaynames = userid_displayname
+		.stream()
+		.expect_ok()
+		.ready_fold(0_usize, |count, (user_id, displayname): (&UserId, &str)| {
+			let key = (user_id, ProfileFieldName::DisplayName.as_str());
+			let value = displayname.to_owned();
+
+			useridprofilekey_value.put(key, Json(value));
+
+			count.saturating_add(1)
+		})
+		.await;
+
+	let avatar_urls = userid_avatarurl
+		.stream()
+		.expect_ok()
+		.ready_fold(0_usize, |count, (user_id, avatar_url): (&UserId, &str)| {
+			let key = (user_id, ProfileFieldName::AvatarUrl.as_str());
+			let value = avatar_url.to_owned();
+
+			useridprofilekey_value.put(key, Json(value));
+
+			count.saturating_add(1)
+		})
+		.await;
+
+	let blurhashes = userid_blurhash
+		.stream()
+		.expect_ok()
+		.ready_fold(0_usize, |count, (user_id, blurhash): (&UserId, &str)| {
+			let key = (user_id, "xyz.amorgan.blurhash");
+			let value = blurhash.to_owned();
+
+			useridprofilekey_value.put(key, Json(value));
+
+			count.saturating_add(1)
+		})
+		.await;
+
+	let fixed_strings = useridprofilekey_value
+		.raw_stream()
+		.expect_ok()
+		.ready_fold(0_usize, |count, (key, value)| {
+			if serde_json::from_slice::<IgnoredAny>(value).is_err() {
+				let Ok(string) = str::from_utf8(value) else {
+					warn!("Non-UTF8 data in profile value: {key:?} => {value:?}");
+					useridprofilekey_value.remove(key);
+					return count;
+				};
+				useridprofilekey_value.raw_put(key, Json(string));
+				return count.saturating_add(1);
+			}
+
+			count
+		})
+		.await;
+
+	drop(cork);
+	info!(%displaynames, %avatar_urls, %blurhashes, %fixed_strings, "Relocated profile keys into useridprofilekey_value");
+
+	db["global"].insert(b"migrate_profile_keys_to_useridprofilekey", []);
+	db.engine.sort()
+}
+
+/// One-time clear of the ephemeral peer-status reachability rows, so the new
+/// span-based backoff fold does not misread v1.8.1's per-bucket failure rows.
+async fn clear_servername_status(services: &Services) -> Result {
+	let db = &services.db;
+
+	warn!("Clearing federation peer-status reachability rows");
+	db["servername_status"].clear().await;
+
+	db["global"].insert(b"clear_servername_status", []);
 	db.engine.sort()
 }

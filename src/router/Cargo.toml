@@ -19,11 +19,11 @@ crate-type = [
 
 [features]
 brotli_compression = [
+	"tower-http/compression-br",
 	"tuwunel-admin/brotli_compression",
 	"tuwunel-api/brotli_compression",
 	"tuwunel-core/brotli_compression",
 	"tuwunel-service/brotli_compression",
-	"tower-http/compression-br",
 ]
 bzip2_compression = [
 	"tuwunel-admin/bzip2_compression",
@@ -32,15 +32,15 @@ bzip2_compression = [
 ]
 direct_tls = [
 	"axum-server/tls-rustls",
-	"dep:rustls",
 	"dep:axum-server-dual-protocol",
+	"dep:rustls",
 ]
 gzip_compression = [
+	"tower-http/compression-gzip",
 	"tuwunel-admin/gzip_compression",
 	"tuwunel-api/gzip_compression",
 	"tuwunel-core/gzip_compression",
 	"tuwunel-service/gzip_compression",
-	"tower-http/compression-gzip",
 ]
 io_uring = [
 	"tuwunel-admin/io_uring",
@@ -77,29 +77,29 @@ lz4_compression = [
 	"tuwunel-service/lz4_compression",
 ]
 release_max_log_level = [
+	"log/max_level_trace",
+	"log/release_max_level_info",
+	"tracing/max_level_trace",
+	"tracing/release_max_level_info",
 	"tuwunel-admin/release_max_log_level",
 	"tuwunel-api/release_max_log_level",
 	"tuwunel-core/release_max_log_level",
 	"tuwunel-service/release_max_log_level",
-	"tracing/max_level_trace",
-	"tracing/release_max_level_info",
-	"log/max_level_trace",
-	"log/release_max_level_info",
 ]
 sentry_telemetry = [
-	"tuwunel-core/sentry_telemetry",
 	"dep:sentry",
-	"dep:sentry-tracing",
 	"dep:sentry-tower",
+	"dep:sentry-tracing",
+	"tuwunel-core/sentry_telemetry",
 ]
 systemd = [
 	"dep:sd-notify",
 ]
 zstd_compression = [
+	"tower-http/compression-zstd",
 	"tuwunel-api/zstd_compression",
 	"tuwunel-core/zstd_compression",
 	"tuwunel-service/zstd_compression",
-	"tower-http/compression-zstd",
 ]
 
 [dependencies]

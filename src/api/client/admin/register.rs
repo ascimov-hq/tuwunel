@@ -33,7 +33,7 @@ pub(crate) async fn admin_register_route(
 	check_field("Username", &body.username)?;
 	check_field("Password", &body.password)?;
 
-	verify_mac(shared_secret, &body)
+	verify_mac(&shared_secret, &body)
 		.map_err(|()| err!(Request(Forbidden("HMAC check failed"))))?;
 
 	let user_id = resolve_local_user_id(services, &body.username)?;
@@ -135,7 +135,9 @@ fn decode_hex(s: &str) -> Option<Vec<u8>> {
 	s.len().is_multiple_of(2).then_some(())?;
 
 	s.as_bytes()
-		.chunks_exact(2)
+		.as_chunks::<2>()
+		.0
+		.iter()
 		.map(|c| Some((hex_nibble(c[0])? << 4) | hex_nibble(c[1])?))
 		.collect()
 }

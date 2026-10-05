@@ -32,7 +32,11 @@ use crate::admin_command_dispatch;
 pub(crate) enum UsersCommand {
 	CountUsers,
 
-	IterUsers,
+	IterUsers {
+		/// Only list historical user ids
+		#[arg(long)]
+		historical: bool,
+	},
 
 	PasswordHash {
 		user_id: OwnedUserId,

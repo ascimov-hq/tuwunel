@@ -73,6 +73,7 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "eventid_backoff",
+		ttl: 60 * 60 * 24 * 3, // dead after the max fetch-backoff window (24h)
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
@@ -103,10 +104,12 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "eventid_policysigstate",
+		ttl: 60 * 60 * 24 * 7, // backoff/refusal hint; re-ask fails open
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
 		name: "eventid_resolvedstate",
+		ttl: 60 * 60 * 24 * 7, // refetch-avoidance only; safe to evict
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
@@ -145,6 +148,21 @@ pub(super) static MAPS: &[Descriptor] = &[
 	Descriptor {
 		name: "mediaid_file",
 		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "mediaid_lazy",
+		ttl: 60 * 60 * 24 * 30, // must outlive url_preview so live previews resolve
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
+		name: "mediaid_lazycontent",
+		key_size_hint: Some(64),
+		val_size_hint: Some(1024 * 256),
+		file_size: 1024 * 1024 * 64,
+		write_size: 1024 * 1024 * 64,
+		compression: CompressionType::None, // media bytes are pre-compressed
+		ttl: 60 * 60 * 24 * 14,             // staging only: rows die at promotion or here
+		..descriptor::RANDOM_CACHE
 	},
 	Descriptor {
 		name: "mediaid_pending",
@@ -239,6 +257,12 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM
 	},
 	Descriptor {
+		name: "relatesto_typed",
+		key_size_hint: Some(33),
+		val_size_hint: Some(8),
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
 		name: "registrationtoken_info",
 		..descriptor::RANDOM_SMALL
 	},
@@ -279,6 +303,7 @@ pub(super) static MAPS: &[Descriptor] = &[
 	Descriptor {
 		name: "roomid_spacehierarchy",
 		limit_size: 1024 * 1024 * 64,
+		ttl: 60 * 60 * 24 * 7, // above spacehierarchy_cache_ttl_max (18h default)
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
@@ -355,6 +380,7 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "servername_destination",
+		ttl: 60 * 60 * 24 * 7, // dead after CachedDest::default_expire (<=36h)
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
@@ -363,10 +389,12 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "servername_override",
+		ttl: 60 * 60 * 24 * 7, // dead after CachedOverride::default_expire (<=12h)
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
 		name: "servername_status",
+		ttl: 60 * 60 * 24 * 3, // dead after peer MAX_BACKOFF (24h)
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
@@ -433,8 +461,19 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM
 	},
 	Descriptor {
+		name: "threadactivityid_rootid",
+		key_size_hint: Some(16),
+		..descriptor::SEQUENTIAL_SMALL
+	},
+	Descriptor {
 		name: "threadid_userids",
 		..descriptor::SEQUENTIAL_SMALL
+	},
+	Descriptor {
+		name: "threadrootid_latestcount",
+		key_size_hint: Some(16),
+		val_size_hint: Some(8),
+		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {
 		name: "threepidsid_pending",
@@ -469,8 +508,13 @@ pub(super) static MAPS: &[Descriptor] = &[
 		..descriptor::RANDOM
 	},
 	Descriptor {
+		name: "url_preview",
+		ttl: 60 * 60 * 24 * 7, // dead after CachedPreview::EXPIRE (24h)
+		..descriptor::RANDOM_SMALL_CACHE
+	},
+	Descriptor {
 		name: "url_previews",
-		..descriptor::RANDOM
+		..descriptor::DROPPED
 	},
 	Descriptor {
 		name: "userdeviceid_metadata",
@@ -503,6 +547,7 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "userdevicesessionid_uiaainfo",
+		ttl: 60 * 60 * 24, // interactive-auth session; minutes to complete
 		..descriptor::RANDOM_SMALL_CACHE
 	},
 	Descriptor {
@@ -535,6 +580,10 @@ pub(super) static MAPS: &[Descriptor] = &[
 	},
 	Descriptor {
 		name: "userid_email",
+		..descriptor::RANDOM_SMALL
+	},
+	Descriptor {
+		name: "userid_erased",
 		..descriptor::RANDOM_SMALL
 	},
 	Descriptor {

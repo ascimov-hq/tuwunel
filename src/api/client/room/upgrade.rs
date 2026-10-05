@@ -291,14 +291,11 @@ async fn upgrade_room_create_legacy(
 
 	// Send a m.room.create event containing a predecessor field and the applicable
 	// room_version. "creator" key no longer exists in V11+ rooms.
-	{
-		use RoomVersionId::*;
-		match new_version {
-			| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 =>
-				content.insert("creator".into(), json!(&sender_user).try_into()?),
-			| _ => content.remove("creator"),
-		}
-	};
+	if !version_rules.authorization.use_room_create_sender {
+		content.insert("creator".into(), json!(&sender_user).try_into()?);
+	} else {
+		content.remove("creator");
+	}
 
 	content.insert("predecessor".into(), json!(predecessor).try_into()?);
 	content.insert("room_version".into(), json!(new_version).try_into()?);
@@ -457,6 +454,9 @@ async fn move_state_events(&self) -> Result {
 // MSC4168: copy m.space.parent for any room, plus m.space.child when the
 // old room is itself a space, into the upgraded room.
 #[implement(RoomUpgradeContext, params = "<'_>")]
+// try_for_each requires FnMut returning a nameable future; an async closure
+// capturing self does not satisfy it.
+#[expect(closure_returning_async_block)]
 #[tracing::instrument(level = "debug")]
 async fn move_space_state(&self) -> Result {
 	let old_room_is_space = self

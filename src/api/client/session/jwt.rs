@@ -14,7 +14,7 @@ use crate::Ruma;
 #[derive(Debug, Deserialize)]
 struct Claim {
 	/// Subject is the localpart of the User MXID
-	#[allow(dead_code)]
+	#[expect(dead_code)]
 	sub: String,
 	/// Custom claim containing the matrix username
 	username: Option<String>,

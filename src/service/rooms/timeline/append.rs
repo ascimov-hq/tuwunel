@@ -5,6 +5,7 @@ use ruma::{
 	events::{
 		TimelineEventType,
 		receipt::ReceiptThread,
+		relation::RelationType,
 		room::{
 			encrypted::Relation,
 			member::{MembershipState, RoomMemberEventContent},
@@ -18,14 +19,18 @@ use tuwunel_core::{
 		pdu::{PduCount, PduEvent, PduId, RawPduId},
 		room_version,
 	},
+	smallvec::SmallVec,
 	utils::{self, result::LogErr},
 };
 use tuwunel_database::Json;
 
 use super::{ExtractBody, ExtractRelatesTo, ExtractRelatesToEventId, RoomMutexGuard, bias_count};
 use crate::rooms::{
-	short::ShortRoomId, state_accessor::plain_text_topic, state_compressor::CompressedState,
+	read_receipt::PrivateRead, short::ShortRoomId, state_accessor::plain_text_topic,
+	state_compressor::CompressedState,
 };
+
+type Band<'a> = SmallVec<[&'a EventId; 1]>;
 
 /// Append the incoming event setting the state snapshot to the state from
 /// the server that sent the event.
@@ -61,10 +66,14 @@ where
 			.pdu_metadata
 			.mark_as_referenced(&pdu.room_id, pdu.prev_events.iter().map(AsRef::as_ref));
 
-		self.services
-			.state
-			.set_forward_extremities(&pdu.room_id, new_room_leafs, state_lock)
-			.await;
+		// Keep the previous band rather than let a soft-failed event empty it; a
+		// later accepted event self-chains and heals it.
+		if let Some(new_room_leafs) = nonempty_band(new_room_leafs) {
+			self.services
+				.state
+				.set_forward_extremities(&pdu.room_id, new_room_leafs.into_iter(), state_lock)
+				.await;
+		}
 
 		return Ok(None);
 	}
@@ -74,6 +83,15 @@ where
 		.await?;
 
 	Ok(Some(pdu_id))
+}
+
+fn nonempty_band<'a, Leafs>(leafs: Leafs) -> Option<Band<'a>>
+where
+	Leafs: Iterator<Item = &'a EventId>,
+{
+	let leafs: Band<'_> = leafs.collect();
+
+	(!leafs.is_empty()).then_some(leafs)
 }
 
 /// Creates a new persisted data unit and adds it to a room.
@@ -158,34 +176,66 @@ where
 		.set_forward_extremities(pdu.room_id(), leafs, state_lock)
 		.await;
 
+	// Senders in an exclusive appservice namespace (bridge ghosts and bots) never
+	// read rooms and are never push targets, so their read marker and
+	// notification counts are dead bookkeeping (several writes per event).
+	let track_sender_reads = !self
+		.services
+		.config
+		.appservice_skip_sender_read_markers
+		|| !self
+			.services
+			.appservice
+			.is_exclusive_user_id(pdu.sender())
+			.await;
+
 	let insert_lock = self.mutex_insert.lock(pdu.room_id()).await;
-	let next_count1 = self.services.globals.next_count();
-	let next_count2 = self.services.globals.next_count();
+	let next_count = self.services.globals.next_count();
 
 	// Mark as read first so the sending client doesn't get a notification even if
 	// appending fails. Route through the dispatcher so per-thread counts are
 	// also cleared; the sender's own send subsumes any thread receipt.
-	self.services
-		.read_receipt
-		.private_read_set(pdu.room_id(), pdu.sender(), *next_count2, &ReceiptThread::Unthreaded)
-		.await;
+	if track_sender_reads {
+		self.services
+			.read_receipt
+			.private_read_set(PrivateRead {
+				room_id: pdu.room_id(),
+				user_id: pdu.sender(),
+				count: *next_count,
+				ts: pdu.origin_server_ts(),
+				thread: &ReceiptThread::Unthreaded,
+				announce: false,
+			})
+			.await;
+	}
 
-	self.services
-		.pusher
-		.reset_notification_counts_for_thread(
-			pdu.sender(),
-			pdu.room_id(),
-			&ReceiptThread::Unthreaded,
-		)
-		.await;
+	let notifications_cleared = track_sender_reads
+		&& self
+			.services
+			.pusher
+			.reset_notification_counts_for_thread(
+				pdu.sender(),
+				pdu.room_id(),
+				&ReceiptThread::Unthreaded,
+			)
+			.await;
 
-	let count = PduCount::Normal(*next_count1);
+	let count = PduCount::Normal(*next_count);
 	let pdu_id: RawPduId = PduId { shortroomid, count }.into();
 
 	// Insert pdu
 	self.append_pdu_json(&pdu_id, pdu, &pdu_json);
 
 	drop(insert_lock);
+
+	if notifications_cleared {
+		self.services
+			.sending
+			.refresh_push_badge(pdu.sender())
+			.await
+			.log_err()
+			.ok();
+	}
 
 	self.services
 		.pusher
@@ -197,8 +247,7 @@ where
 	self.append_pdu_effects(pdu_id, pdu, shortroomid, count, state_lock)
 		.await?;
 
-	drop(next_count1);
-	drop(next_count2);
+	drop(next_count);
 
 	self.services
 		.appservice
@@ -242,10 +291,6 @@ async fn append_pdu_effects(
 					.await?;
 			}
 		},
-		| TimelineEventType::SpaceChild =>
-			if let Some(_state_key) = pdu.state_key() {
-				self.services.spaces.cache_evict(pdu.room_id());
-			},
 		| TimelineEventType::RoomMember => {
 			if let Some(state_key) = pdu.state_key() {
 				// if the state_key fails
@@ -310,6 +355,11 @@ async fn append_pdu_effects(
 		| _ => {},
 	}
 
+	// The cached hierarchy summary projects room state; evict on any state change.
+	if pdu.state_key().is_some() {
+		self.services.spaces.cache_evict(pdu.room_id());
+	}
+
 	if let Ok(content) = pdu.get_content::<ExtractRelatesToEventId>()
 		&& let Ok(related_pducount) = self
 			.get_pdu_count(&content.relates_to.event_id)
@@ -334,8 +384,32 @@ async fn append_pdu_effects(
 			| Relation::Thread(thread) => {
 				self.services
 					.threads
-					.add_to_thread(&thread.event_id, pdu)
+					.add_to_thread(&thread.event_id, pdu_id, pdu)
 					.await?;
+			},
+			| Relation::Replacement(replacement) => {
+				self.services
+					.pdu_metadata
+					.add_typed_relation(
+						shortroomid,
+						count,
+						&replacement.event_id,
+						pdu,
+						RelationType::Replacement,
+					)
+					.await;
+			},
+			| Relation::Reference(reference) => {
+				self.services
+					.pdu_metadata
+					.add_typed_relation(
+						shortroomid,
+						count,
+						&reference.event_id,
+						pdu,
+						RelationType::Reference,
+					)
+					.await;
 			},
 			| _ => {}, // TODO: Aggregate other types
 		}
@@ -364,4 +438,30 @@ fn append_pdu_json(&self, pdu_id: &RawPduId, pdu: &PduEvent, json: &CanonicalJso
 	self.db
 		.roomid_tscount_pducount
 		.put_raw((pdu.room_id(), ts, count_key), pdu_id.count());
+}
+
+#[cfg(test)]
+mod tests {
+	use std::iter::empty;
+
+	use ruma::event_id;
+
+	use super::*;
+
+	#[test]
+	fn empty_band_is_skipped() {
+		assert!(nonempty_band(empty::<&EventId>()).is_none());
+	}
+
+	#[test]
+	fn nonempty_band_preserves_all_leaves() {
+		let leaves = [event_id!("$a:test.local"), event_id!("$b:test.local")];
+
+		let kept: Vec<&EventId> = nonempty_band(leaves.iter().copied())
+			.expect("non-empty band retained")
+			.into_iter()
+			.collect();
+
+		assert_eq!(kept, leaves);
+	}
 }

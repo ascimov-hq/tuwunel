@@ -6,10 +6,7 @@ use std::{
 	sync::Arc,
 };
 
-use futures::{
-	FutureExt, StreamExt, TryFutureExt, TryStreamExt,
-	future::{join3, join4},
-};
+use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedEventId, OwnedServerName, OwnedUserId, RoomId,
 	RoomOrAliasId, RoomVersionId, UserId,
@@ -28,11 +25,12 @@ use ruma::{
 };
 use serde_json::value::{RawValue as RawJsonValue, to_raw_value};
 use tuwunel_core::{
-	Err, Result, at, debug, debug_error, debug_info, debug_warn, err, error, implement, info,
+	Err, Result, async_noinline, at, debug, debug_error, debug_info, debug_warn, err, error,
+	implement, info,
 	matrix::{event::gen_event_id_canonical_json, room_version},
 	pdu::{Pdu, PduBuilder, check_rules},
 	trace,
-	utils::{self, BoolExt, IterStream, ReadyExt, future::TryExtExt, math::Expected, shuffle},
+	utils::{self, BoolExt, IterStream, ReadyExt, math::Expected, shuffle},
 	warn,
 };
 
@@ -47,35 +45,49 @@ use crate::{
 	},
 };
 
+#[derive(Debug)]
+pub struct Join<'a> {
+	pub sender_user: &'a UserId,
+	pub room_id: &'a RoomId,
+	pub orig_room_id: Option<&'a RoomOrAliasId>,
+	pub reason: Option<String>,
+	pub servers: &'a [OwnedServerName],
+	pub is_appservice: bool,
+	pub extra_content: Option<CanonicalJsonObject>,
+}
+
 #[implement(Service)]
-#[expect(clippy::too_many_arguments)]
+#[async_noinline]
 #[tracing::instrument(
+	name = "join",
 	level = "debug",
 	skip_all,
 	fields(%sender_user, %room_id)
 )]
-pub async fn join(
-	&self,
-	sender_user: &UserId,
-	room_id: &RoomId,
-	orig_room_id: Option<&RoomOrAliasId>,
-	reason: Option<String>,
-	servers: &[OwnedServerName],
-	is_appservice: bool,
-	extra_content: Option<CanonicalJsonObject>,
+pub async fn join<'a>(
+	&'a self,
+	Join {
+		sender_user,
+		room_id,
+		orig_room_id,
+		reason,
+		servers,
+		is_appservice,
+		extra_content,
+	}: Join<'a>,
 ) -> Result {
 	let state_lock = self.services.state.mutex.lock(room_id).await;
 
 	let servers =
 		get_servers_for_room(&self.services, sender_user, room_id, orig_room_id, servers).await?;
 
-	let user_is_guest = self
-		.services
-		.users
-		.is_deactivated(sender_user)
-		.await
-		.unwrap_or(false)
-		&& !is_appservice;
+	let user_is_guest = !is_appservice
+		&& self
+			.services
+			.users
+			.is_deactivated(sender_user)
+			.await
+			.unwrap_or(false);
 
 	if user_is_guest
 		&& !self
@@ -169,7 +181,7 @@ async fn copy_predecessor_push_rules(&self, user_id: &UserId, room_id: &RoomId) 
 	skip_all,
 	fields(?servers)
 )]
-pub async fn join_remote(
+async fn join_remote(
 	&self,
 	sender_user: &UserId,
 	room_id: &RoomId,
@@ -684,7 +696,7 @@ async fn apply_send_join_state(
 
 #[implement(Service)]
 #[tracing::instrument(name = "local", level = "debug", skip_all)]
-pub async fn join_local(
+async fn join_local(
 	&self,
 	sender_user: &UserId,
 	room_id: &RoomId,
@@ -729,49 +741,39 @@ pub async fn join_local(
 		})
 		.await;
 
-	let join_authorized_via_users_server = is_joined_restricted_rooms.then_async(async || {
-		self.services
-			.state_cache
-			.local_users_in_room(room_id)
-			.filter(|user| {
-				self.services.state_accessor.user_can_invite(
-					room_id,
-					user,
-					sender_user,
-					&state_lock,
-				)
-			})
-			.map(ToOwned::to_owned)
-			.boxed()
-			.next()
-			.await
-	});
+	let join_authorized_via_users_server = is_joined_restricted_rooms
+		.then_async(async || {
+			self.services
+				.state_cache
+				.local_users_in_room(room_id)
+				.filter(|user| {
+					self.services.state_accessor.user_can_invite(
+						room_id,
+						user,
+						sender_user,
+						&state_lock,
+					)
+				})
+				.map(ToOwned::to_owned)
+				.boxed()
+				.next()
+				.await
+		})
+		.map(Option::flatten)
+		.await;
 
-	let displayname = self.services.users.displayname(sender_user).ok();
+	let mut content = RoomMemberEventContent {
+		reason: reason.clone(),
+		join_authorized_via_users_server,
+		..RoomMemberEventContent::new(MembershipState::Join)
+	};
 
-	let avatar_url = self.services.users.avatar_url(sender_user).ok();
+	self.services
+		.profile
+		.fill_profile_data(sender_user, &mut content)
+		.await;
 
-	let blurhash = self.services.users.blurhash(sender_user).ok();
-
-	let (displayname, avatar_url, blurhash, join_authorized_via_users_server) = join4(
-		displayname,
-		avatar_url,
-		blurhash,
-		join_authorized_via_users_server.map(Option::flatten),
-	)
-	.await;
-
-	let content = merge_member_content(
-		RoomMemberEventContent {
-			displayname,
-			avatar_url,
-			blurhash,
-			reason: reason.clone(),
-			join_authorized_via_users_server,
-			..RoomMemberEventContent::new(MembershipState::Join)
-		},
-		extra_content.as_ref(),
-	)?;
+	let content = merge_member_content(content, extra_content.as_ref())?;
 
 	let pdu_builder = PduBuilder {
 		event_type: StateEventType::RoomMember.into(),
@@ -849,8 +851,10 @@ pub async fn join_local(
 	self.services
 		.event_handler
 		.handle_incoming_pdu(&remote_server, room_id, &signed_event_id, signed_value, true)
-		.boxed()
-		.await?;
+		.await?
+		.ok_or_else(|| {
+			err!(Request(InvalidParam("Signed join was not accepted as a timeline event.")))
+		})?;
 
 	Ok(())
 }
@@ -884,25 +888,18 @@ async fn create_join_event(
 		})
 		.and_then(|s| OwnedUserId::try_from(s.as_str().unwrap_or_default()).ok());
 
-	let displayname = self.services.users.displayname(sender_user).ok();
+	let mut content = RoomMemberEventContent {
+		reason,
+		join_authorized_via_users_server: join_authorized_via_users_server.clone(),
+		..RoomMemberEventContent::new(MembershipState::Join)
+	};
 
-	let avatar_url = self.services.users.avatar_url(sender_user).ok();
+	self.services
+		.profile
+		.fill_profile_data(sender_user, &mut content)
+		.await;
 
-	let blurhash = self.services.users.blurhash(sender_user).ok();
-
-	let (displayname, avatar_url, blurhash) = join3(displayname, avatar_url, blurhash).await;
-
-	let content = merge_member_content(
-		RoomMemberEventContent {
-			displayname,
-			avatar_url,
-			blurhash,
-			reason,
-			join_authorized_via_users_server: join_authorized_via_users_server.clone(),
-			..RoomMemberEventContent::new(MembershipState::Join)
-		},
-		extra_content.as_ref(),
-	)?;
+	let content = merge_member_content(content, extra_content.as_ref())?;
 
 	event.insert("content".into(), content);
 

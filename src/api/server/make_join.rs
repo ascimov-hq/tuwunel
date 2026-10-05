@@ -1,7 +1,7 @@
 use axum::extract::State;
 use futures::{StreamExt, TryFutureExt, pin_mut};
 use ruma::{
-	OwnedUserId, RoomId, RoomVersionId, UserId,
+	OwnedUserId, RoomId, UserId,
 	api::{
 		error::{ErrorKind, IncompatibleRoomVersionErrorData},
 		federation::membership::prepare_join_event,
@@ -15,10 +15,13 @@ use ruma::{
 	},
 };
 use tuwunel_core::{
-	Err, Error, Result, at, debug_info, matrix::pdu::PduBuilder, utils::IterStream,
+	Err, Error, Result, at, debug_info,
+	matrix::{RoomVersionRules, pdu::PduBuilder, room_version},
+	utils::IterStream,
 };
 use tuwunel_service::Services;
 
+use super::utils::require_known_room;
 use crate::Ruma;
 
 /// # `GET /_matrix/federation/v1/make_join/{roomId}/{userId}`
@@ -28,19 +31,11 @@ pub(crate) async fn create_join_event_template_route(
 	State(services): State<crate::State>,
 	body: Ruma<prepare_join_event::v1::Request>,
 ) -> Result<prepare_join_event::v1::Response> {
-	if !services.metadata.exists(&body.room_id).await {
-		return Err!(Request(NotFound("Room is unknown to this server.")));
-	}
+	require_known_room(&services, &body.room_id, body.origin()).await?;
 
 	if body.user_id.server_name() != body.origin() {
 		return Err!(Request(BadJson("Not allowed to join on behalf of another server/user.")));
 	}
-
-	// ACL check origin server
-	services
-		.event_handler
-		.acl_check(body.origin(), &body.room_id)
-		.await?;
 
 	if let Some(server) = body.room_id.server_name()
 		&& services
@@ -66,18 +61,16 @@ pub(crate) async fn create_join_event_template_route(
 		));
 	}
 
+	let room_version_rules = room_version::rules(&room_version_id)?;
+
 	let state_lock = services.state.mutex.lock(&body.room_id).await;
 
-	let join_authorized_via_users_server: Option<OwnedUserId> = {
-		use RoomVersionId::*;
-		if matches!(room_version_id, V1 | V2 | V3 | V4 | V5 | V6 | V7) {
-			// room version does not support restricted join rules
-			None
-		} else if user_can_perform_restricted_join(
+	let join_authorized_via_users_server: Option<OwnedUserId> =
+		if user_can_perform_restricted_join(
 			&services,
 			&body.user_id,
 			&body.room_id,
-			&room_version_id,
+			&room_version_rules,
 		)
 		.await?
 		{
@@ -104,8 +97,7 @@ pub(crate) async fn create_join_event_template_route(
 			Some(auth_user)
 		} else {
 			None
-		}
-	};
+		};
 
 	let pdu_json = services
 		.timeline
@@ -137,12 +129,12 @@ pub(crate) async fn user_can_perform_restricted_join(
 	services: &Services,
 	user_id: &UserId,
 	room_id: &RoomId,
-	room_version_id: &RoomVersionId,
+	room_version_rules: &RoomVersionRules,
 ) -> Result<bool> {
-	use RoomVersionId::*;
-
-	// restricted rooms are not supported on <=v7
-	if matches!(room_version_id, V1 | V2 | V3 | V4 | V5 | V6 | V7) {
+	if !room_version_rules
+		.authorization
+		.restricted_join_rule
+	{
 		return Ok(false);
 	}
 

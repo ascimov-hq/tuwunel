@@ -81,18 +81,18 @@ impl Server {
 fn can_build(args: &crate::Args<'_>) -> bool {
 	let has_idp = !args.server.config.identity_provider.is_empty();
 	let has_cwk = args.server.config.well_known.client.is_some();
+	let native = args.server.config.oidc_native_auth;
 
-	if has_idp && !has_cwk {
-		warn!(
-			"OIDC server (Next-gen auth) requires `well_known.client` to be configured to serve \
-			 your `identity_provider`."
-		);
+	if (has_idp || native) && !has_cwk {
+		warn!("OIDC server (Next-gen auth) requires `well_known.client` to be configured.");
+
+		return false;
 	}
 
-	if !has_idp || !has_cwk {
+	if !has_idp && !native {
 		debug_warn!(
-			"OIDC server (Next-gen auth) requires at least one `identity_provider` to be \
-			 configured."
+			"OIDC server (Next-gen auth) requires at least one `identity_provider`, or \
+			 `oidc_native_auth` to be enabled."
 		);
 
 		return false;
@@ -110,7 +110,8 @@ pub fn issuer_url(&self) -> Result<String> {
 		.as_ref()
 		.map(|url| {
 			let s = url.to_string();
-			if s.ends_with('/') { s } else { s + "/" }
+
+			if s.ends_with('/') { s } else { format!("{s}/") }
 		})
 		.ok_or_else(|| {
 			err!(Config("well_known.client", "well_known.client must be set for OIDC server"))
@@ -125,11 +126,12 @@ const DEVICE_SCOPE_PREFIXES: [&str; 2] =
 const API_SCOPE_PREFIXES: [&str; 2] =
 	["urn:matrix:client:api:", "urn:matrix:org.matrix.msc2967.client:api:"];
 
-/// Narrow a requested scope to the granted scope (RFC 6749 §3.3): keep the
-/// tokens this server recognises and return them alongside the MSC2967 device
-/// id, when one was requested. Unrecognised tokens are dropped, or rejected
-/// when `strict` is set. A request carrying more than one device scope, or a
-/// device id outside the RFC 3986 unreserved set, is always rejected.
+/// Restricts a requested OAuth scope to supported tokens per RFC 6749 §3.3.
+///
+/// Recognized tokens retain their request order, with an MSC2967 device ID
+/// returned separately when present. Unknown tokens are dropped unless `strict`
+/// is set. Multiple device scopes, empty device IDs, and IDs outside the RFC
+/// 6749 scope-token character set return an error.
 pub fn narrow_scope(requested: &str, strict: bool) -> Result<(String, Option<String>)> {
 	let mut granted = String::new();
 	let mut device_id: Option<&str> = None;
@@ -142,8 +144,8 @@ pub fn narrow_scope(requested: &str, strict: bool) -> Result<(String, Option<Str
 			if device_id.is_some() {
 				return Err!(Request(InvalidParam("more than one device scope requested")));
 			}
-			if id.is_empty() || !id.bytes().all(is_unreserved) {
-				return Err!(Request(InvalidParam("device id contains a reserved character")));
+			if id.is_empty() || !id.bytes().all(is_scope_char) {
+				return Err!(Request(InvalidParam("device id contains an invalid character")));
 			}
 
 			device_id = Some(id);
@@ -169,10 +171,10 @@ pub fn narrow_scope(requested: &str, strict: bool) -> Result<(String, Option<Str
 	Ok((granted, device_id.map(ToOwned::to_owned)))
 }
 
+/// RFC 6749 appendix A NQCHAR: printable ASCII except space, double quote
+/// and backslash. MSC4108 clients use unpadded base64 device ids.
 #[inline]
-fn is_unreserved(b: u8) -> bool {
-	b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~')
-}
+fn is_scope_char(b: u8) -> bool { b.is_ascii_graphic() && !matches!(b, b'"' | b'\\') }
 
 #[cfg(test)]
 mod tests {
@@ -211,7 +213,16 @@ mod tests {
 	}
 
 	#[test]
-	fn narrow_scope_rejects_reserved_device_id() {
-		narrow_scope("urn:matrix:client:device:bad/id", false).unwrap_err();
+	fn narrow_scope_accepts_base64_device_id() {
+		let scope = "urn:matrix:client:device:wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/V+afGmU5+0";
+		let (_granted, device) = narrow_scope(scope, false).expect("narrows");
+
+		assert_eq!(device.as_deref(), Some("wjLpTLRqbqBzLs63aYaEv2Boi6cFEbbM/V+afGmU5+0"));
+	}
+
+	#[test]
+	fn narrow_scope_rejects_invalid_device_id() {
+		narrow_scope("urn:matrix:client:device:bad\"id", false).unwrap_err();
+		narrow_scope("urn:matrix:client:device:bad\\id", false).unwrap_err();
 	}
 }

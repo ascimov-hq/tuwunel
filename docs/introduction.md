@@ -4,6 +4,16 @@
 
 {{#include ../README.md:body}}
 
+#### Fund Tuwunel's next stage
+
+An independent academic study measured a single Tuwunel process outperforming
+an 18-worker Synapse deployment on `/sync` in all three lazy-loading
+configurations tested under heavy load, while Synapse led in the full-state
+configuration. We are seeking funding for native multi-node scaling,
+redundancy, and failover while preserving Tuwunel's simpler operating model.
+See [Enterprise Development Partnership](funding.md) for the benchmark data,
+current status, and future plans.
+
 #### How can I deploy my own?
 
 - [Deployment options](deploying.md)

@@ -2,6 +2,8 @@ use futures::FutureExt;
 use ruma::{UserId, events::GlobalAccountDataEventType, push};
 use tuwunel_core::{Err, Result, error, implement, info, is_equal_to, warn};
 
+use crate::{membership::Join, profile::Propagation};
+
 #[derive(Debug, Default)]
 pub struct Register<'a> {
 	pub user_id: Option<&'a UserId>,
@@ -74,25 +76,36 @@ pub async fn full_register(
 	}
 
 	self.services
-		.users
-		.set_displayname(user_id, Some(displayname));
-
-	// Initial account data
-	self.services
-		.account_data
-		.update(
-			None,
-			user_id,
-			GlobalAccountDataEventType::PushRules
-				.to_string()
-				.into(),
-			&serde_json::to_value(ruma::events::push_rules::PushRulesEvent {
-				content: ruma::events::push_rules::PushRulesEventContent {
-					global: push::Ruleset::server_default(user_id),
-				},
-			})?,
-		)
+		.profile
+		.set_displayname(user_id, Some(displayname), Some(Propagation::None))
 		.await?;
+
+	// Initial account data. Appservice users (bridge ghosts) are never
+	// push-evaluated; readers fall back to the server-default ruleset when the
+	// event is missing (and GET /pushrules recreates it on demand), so storing
+	// a copy per ghost only costs disk and compaction.
+	if !(is_appservice
+		&& self
+			.services
+			.config
+			.appservice_skip_default_push_rules)
+	{
+		self.services
+			.account_data
+			.update(
+				None,
+				user_id,
+				GlobalAccountDataEventType::PushRules
+					.to_string()
+					.into(),
+				&serde_json::to_value(ruma::events::push_rules::PushRulesEvent {
+					content: ruma::events::push_rules::PushRulesEventContent {
+						global: push::Ruleset::server_default(user_id),
+					},
+				})?,
+			)
+			.await?;
+	}
 
 	// If this is the first real user, grant them admin privileges except for guest
 	// users
@@ -142,16 +155,15 @@ pub async fn full_register(
 			match self
 				.services
 				.membership
-				.join(
-					user_id,
-					&room_id,
-					Some(room),
-					Some("Automatically joining this room upon registration".to_owned()),
-					&[],
-					false,
-					None,
-				)
-				.boxed()
+				.join(Join {
+					sender_user: user_id,
+					room_id: &room_id,
+					orig_room_id: Some(room),
+					reason: Some("Automatically joining this room upon registration".to_owned()),
+					servers: &[],
+					is_appservice: false,
+					extra_content: None,
+				})
 				.await
 			{
 				| Err(e) => {

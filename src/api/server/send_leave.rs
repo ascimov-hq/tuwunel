@@ -10,6 +10,7 @@ use ruma::{
 };
 use tuwunel_core::{Err, Result, at, err, matrix::event::gen_event_id_canonical_json};
 
+use super::utils::require_known_room;
 use crate::Ruma;
 
 /// # `PUT /_matrix/federation/v2/send_leave/{roomId}/{eventId}`
@@ -22,15 +23,9 @@ pub(crate) async fn create_leave_event_v2_route(
 	let room_id = &body.room_id;
 	let origin = body.origin();
 
-	if !services.metadata.exists(room_id).await {
-		return Err!(Request(NotFound("Room is unknown to this server.")));
-	}
+	services.sending.notify_peer_alive(origin).await;
 
-	// ACL check origin
-	services
-		.event_handler
-		.acl_check(origin, room_id)
-		.await?;
+	require_known_room(&services, room_id, origin).await?;
 
 	// We do not add the event_id field to the pdu here because of signature and
 	// hashes checks
@@ -125,7 +120,6 @@ pub(crate) async fn create_leave_event_v2_route(
 	let pdu_id = services
 		.event_handler
 		.handle_incoming_pdu(origin, room_id, &event_id, value, true)
-		.boxed()
 		.await?
 		.map(at!(0))
 		.ok_or_else(|| err!(Request(InvalidParam("Could not accept as timeline event."))))?;

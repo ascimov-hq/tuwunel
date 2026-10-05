@@ -130,7 +130,7 @@ variable "gz_image_compress_level" {
     default = 7
 }
 variable "cache_compress_level" {
-    default = 7
+    default = 3
 }
 
 # Options for output verbosity
@@ -270,10 +270,12 @@ group "lints" {
 group "tests" {
     targets = [
         "doc",
-        "unit",
-        "smoke",
         "integration",
         "matrix-compliance",
+        "mas",
+        "playwright",
+        "smoke",
+        "unit",
     ]
 }
 
@@ -281,7 +283,6 @@ group "matrix-compliance" {
     targets = [
         "complement",
         "complement-crypto",
-        "rust-sdk-integ",
     ]
 }
 
@@ -380,6 +381,11 @@ target "complement-testee-valgrind" {
         input = elem("target:smoke-valgrind", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
         complement-tester = elem("target:complement-tester-valgrind", [sys_name, sys_version, sys_target])
     }
+    args = {
+        # Leave the valgrind testee on the default policy: it is already
+        # serialized by valgrind, and a realtime class would only interfere.
+        sched_policy = ""
+    }
 }
 
 target "complement-testee" {
@@ -388,7 +394,7 @@ target "complement-testee" {
         elem_tag("complement-testee", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
     target = "complement-testee"
-    output = ["type=docker,compression=zstd,mode=min"]
+    output = ["type=docker,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
     entitlements = ["network.host"]
     dockerfile = "${docker_dir}/Dockerfile.complement"
     matrix = cargo_rust_feat_sys
@@ -402,6 +408,13 @@ target "complement-testee" {
     }
     args = {
         RUST_BACKTRACE = "full"
+
+        # An optimized testee (any non-debug profile) runs the suite as a
+        # timing-sensitive job under --fifo; the debug testee is an ordinary
+        # test under --rr. Realtime needs CAP_SYS_NICE, which the Complement
+        # runner grants the testee container; sched_wrap.sh degrades otherwise.
+        sched_policy = (cargo_profile == "test"? "--rr": "--fifo")
+        sched_prio = (cargo_profile == "test"? 1: 2)
     }
 }
 
@@ -426,7 +439,7 @@ target "complement-tester" {
         elem_tag("complement-tester", [sys_name, sys_version, sys_target], "latest"),
     ]
     target = "complement-tester"
-    output = ["type=docker,compression=zstd,mode=min,compression-level=${zstd_image_compress_level}"]
+    output = ["type=docker,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     entitlements = ["network.host"]
     matrix = sys
     inherits = [
@@ -491,7 +504,7 @@ target "mas-testee" {
         "tuwunel-mas-testee:latest",
     ]
     target = "mas-testee"
-    output = ["type=docker,compression=zstd,mode=min"]
+    output = ["type=docker,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
     dockerfile = "${docker_dir}/Dockerfile.mas"
     matrix = cargo_rust_feat_sys
     inherits = [
@@ -534,7 +547,7 @@ target "complement-crypto-tester" {
         elem_tag("complement-crypto-tester", [sys_name, sys_version, sys_target], "latest"),
     ]
     target = "complement-crypto-tester"
-    output = ["type=docker,compression=zstd,mode=min,compression-level=${zstd_image_compress_level}"]
+    output = ["type=docker,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     entitlements = ["network.host"]
     dockerfile = "${docker_dir}/Dockerfile.complement-crypto"
     matrix = sys
@@ -639,7 +652,7 @@ target "playwright-testee" {
         "tuwunel-playwright-testee:latest",
     ]
     target = "playwright-testee"
-    output = ["type=docker,compression=zstd,mode=min"]
+    output = ["type=docker,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
     dockerfile = "${docker_dir}/Dockerfile.playwright"
     matrix = cargo_rust_feat_sys
     inherits = [
@@ -676,7 +689,7 @@ target "playwright-tester" {
         "tuwunel-playwright-tester:latest",
     ]
     target = "playwright-tester"
-    output = ["type=docker,compression=zstd,mode=min,compression-level=${zstd_image_compress_level}"]
+    output = ["type=docker,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     dockerfile = "${docker_dir}/Dockerfile.playwright"
     matrix = sys
     inherits = [
@@ -684,6 +697,7 @@ target "playwright-tester" {
     ]
     contexts = {
         input = elem("target:playwright-base", [sys_name, sys_version, sys_target])
+        source = elem("target:source", [sys_name, sys_version, sys_target])
     }
     args = playwright_args
 }
@@ -747,7 +761,7 @@ target "rust-sdk-integ" {
     tags = [
         elem_tag("rust-sdk-integ", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
-    output = ["type=docker,compression=zstd,mode=max,compression-level=${zstd_image_compress_level}"]
+    output = ["type=docker,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
     target = "rust-sdk-integration"
     dockerfile = "${docker_dir}/Dockerfile.matrix-rust-sdk"
     matrix = cargo_rust_feat_sys
@@ -795,11 +809,16 @@ target "integ-valgrind" {
         VALGRINDFLAGS = "${valgrind_flags}"
         cargo_cmd = "valgrind test"
         cargo_args = "--test=*"
+
+        # valgrind already serializes; keep it off the realtime class integ now grants
+        sched_policy = ""
     }
 }
 
 target "integ" {
     name = elem("integ", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
+    # raise RLIMIT_RTPRIO so the realtime sched_policy in args is grantable (build RUN lacks CAP_SYS_NICE)
+    ulimits = ["rtprio=49"]
     tags = [
         elem_tag("integ", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
@@ -818,7 +837,7 @@ target "integ" {
         )
 
         sched_policy = (cargo_profile == "bench"? "--fifo": "--rr")
-        sched_prio = 1
+        sched_prio = (cargo_profile == "bench"? 3: 1)
     }
 }
 
@@ -841,7 +860,7 @@ target "smoke-nix" {
     tags = [
         elem_tag("smoke-nix", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
-    output = ["type=cacheonly,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
+    output = ["type=cacheonly,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     dockerfile = "${docker_dir}/Dockerfile.nix"
     target = "smoke-nix"
     matrix = cargo_rust_feat_sys
@@ -912,7 +931,7 @@ target "tests-smoke" {
         elem_tag("tests-smoke", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
     target = "smoke-startup"
-    output = ["type=cacheonly,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
+    output = ["type=cacheonly,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     dockerfile = "${docker_dir}/Dockerfile.smoketest"
     matrix = cargo_rust_feat_sys
     inherits = [
@@ -944,11 +963,16 @@ target "unit-valgrind" {
         VALGRINDFLAGS = "${valgrind_flags}"
         cargo_cmd = "valgrind test"
         cargo_args = "--lib --bins"
+
+        # valgrind already serializes; keep it off the realtime class unit now grants
+        sched_policy = ""
     }
 }
 
 target "unit" {
     name = elem("unit", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
+    # raise RLIMIT_RTPRIO so the realtime sched_policy in args is grantable (build RUN lacks CAP_SYS_NICE)
+    ulimits = ["rtprio=49"]
     tags = [
         elem_tag("unit", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
@@ -967,12 +991,14 @@ target "unit" {
         )
 
         sched_policy = (cargo_profile == "bench"? "--fifo": "--rr")
-        sched_prio = 1
+        sched_prio = (cargo_profile == "bench"? 3: 1)
     }
 }
 
 target "doc" {
     name = elem("doc", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
+    # raise RLIMIT_RTPRIO so the realtime sched_policy in args is grantable (build RUN lacks CAP_SYS_NICE)
+    ulimits = ["rtprio=49"]
     tags = [
         elem_tag("doc", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
@@ -988,6 +1014,9 @@ target "doc" {
         cargo_cmd = "test"
         cargo_args = "--doc --no-fail-fast"
         RUSTDOCFLAGS = "-D warnings"
+
+        sched_policy = "--rr"
+        sched_prio = 1
     }
 }
 
@@ -1070,6 +1099,7 @@ target "docker" {
         COPY --from=input . .
         EXPOSE 8008 8448
         ENTRYPOINT ["tuwunel"]
+        HEALTHCHECK --interval=30s --timeout=15s --start-period=60s CMD ["tuwunel", "--health-check"]
 EOF
 }
 
@@ -1078,7 +1108,7 @@ target "static" {
     tags = [
         elem_tag("static", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
-    output = ["type=docker,compression=uncompressed,mode=min"]
+    output = ["type=docker,compression=zstd,mode=min,compression-level=${zstd_image_compress_level}"]
     matrix = cargo_rust_feat_sys
     inherits = [
         elem("install", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
@@ -1130,7 +1160,7 @@ target "install" {
     ]
     labels = install_labels
     annotations = install_annotations
-    output = ["type=docker,compression=zstd,mode=max,compression-level=${zstd_image_compress_level}"]
+    output = ["type=docker,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     dockerfile = "${docker_dir}/Dockerfile.install"
     target = "install"
     matrix = cargo_rust_feat_sys
@@ -1166,6 +1196,26 @@ group "pkg" {
         "deb-install",
         "rpm-install",
     ]
+}
+
+target "apt-repo-install" {
+    description = "Install tuwunel from the public apt repository as documented."
+    name = elem("apt-repo-install", [sys_name, sys_version, sys_target])
+    tags = [
+        elem_tag("apt-repo-install", [sys_name, sys_version, sys_target], "latest"),
+    ]
+    target = "apt-repo-install"
+    output = ["type=cacheonly,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
+    dockerfile = "${docker_dir}/Dockerfile.apt"
+    context = "."
+    matrix = sys
+    no-cache-filter = ["apt-repo-install"]
+    inherits = [
+        elem("system", [sys_name, sys_version, sys_target]),
+    ]
+    contexts = {
+        input = elem("target:system", [sys_name, sys_version, sys_target])
+    }
 }
 
 target "rpm-install" {
@@ -1214,6 +1264,7 @@ target "build-rpm" {
     ]
     contexts = {
         input = elem("target:build-bins", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
+        source = elem("target:source", [sys_name, sys_version, sys_target]),
     }
     args = {
         pkg_dir = "/opt/tuwunel/rpm"
@@ -1266,6 +1317,7 @@ target "build-deb" {
     ]
     contexts = {
         input = elem("target:build-bins", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
+        source = elem("target:source", [sys_name, sys_version, sys_target]),
     }
     args = {
         pkg_dir = "/opt/tuwunel/deb"
@@ -1277,7 +1329,7 @@ target "nix" {
     tags = [
         elem_tag("nix", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
-    output = ["type=docker,compression=zstd,mode=min,compression-level=${zstd_image_compress_level}"]
+    output = ["type=docker,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     target = "nix-pkg"
     matrix = cargo_rust_feat_sys
     inherits = [
@@ -1290,7 +1342,7 @@ target "build-nix" {
     tags = [
         elem_tag("build-nix", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
-    output = ["type=cacheonly,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
+    output = ["type=cacheonly,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     dockerfile = "${docker_dir}/Dockerfile.nix"
     target = "build-nix"
     matrix = cargo_rust_feat_sys
@@ -1314,7 +1366,7 @@ target "book" {
         elem_tag("book", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
     target = "book"
-    output = ["type=docker,compression=zstd,mode=min,compression-level=${zstd_image_compress_level}"]
+    output = ["type=docker,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     matrix = cargo_rust_feat_sys
     inherits = [
         elem("deps-base", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
@@ -1334,7 +1386,7 @@ target "docs" {
     tags = [
         elem_tag("docs", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
-    output = ["type=docker,compression=zstd,mode=min,compression-level=${zstd_image_compress_level}"]
+    output = ["type=docker,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     matrix = cargo_rust_feat_sys
     inherits = [
         elem("deps-build", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target]),
@@ -1361,11 +1413,12 @@ target "build-bins" {
     ]
     contexts = {
         input = elem("target:deps-build-bins", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
-        source = elem("target:source", [sys_name, sys_version, sys_target])
+        source = elem("target:source-rust", [sys_name, sys_version, sys_target])
     }
     args = {
         cargo_cmd = "build"
         cargo_args = "--bins"
+        cargo_target_prune = "bins"
     }
 }
 
@@ -1381,7 +1434,7 @@ target "build-tests" {
     ]
     contexts = {
         input = elem("target:deps-build-tests", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
-        source = elem("target:source", [sys_name, sys_version, sys_target])
+        source = elem("target:source-rust", [sys_name, sys_version, sys_target])
     }
     args = {
         cargo_cmd = (cargo_profile == "bench"? "bench": "test")
@@ -1401,7 +1454,7 @@ target "build" {
     ]
     contexts = {
         input = elem("target:deps-build", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
-        source = elem("target:source", [sys_name, sys_version, sys_target])
+        source = elem("target:source-rust", [sys_name, sys_version, sys_target])
     }
     args = {
         cargo_cmd = "build"
@@ -1421,11 +1474,12 @@ target "clippy" {
     ]
     contexts = {
         input = elem("target:deps-clippy", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
-        source = elem("target:source", [sys_name, sys_version, sys_target])
+        source = elem("target:source-rust", [sys_name, sys_version, sys_target])
     }
     args = {
         cargo_cmd = "clippy"
         cargo_args = "--all-targets --no-deps -- -D warnings -A unstable-features"
+        cargo_target_prune = "all"
     }
 }
 
@@ -1441,11 +1495,12 @@ target "check" {
     ]
     contexts = {
         input = elem("target:deps-check", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
-        source = elem("target:source", [sys_name, sys_version, sys_target])
+        source = elem("target:source-rust", [sys_name, sys_version, sys_target])
     }
     args = {
         cargo_cmd = "check"
         cargo_args = "--all-targets"
+        cargo_target_prune = "all"
     }
 }
 
@@ -1523,14 +1578,14 @@ target "fmt" {
 target "cargo" {
     name = elem("cargo", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
     target = "cargo"
-    output = ["type=cacheonly,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
+    output = ["type=cacheonly,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     matrix = cargo_rust_feat_sys
     inherits = [
         elem("deps-base", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
     ]
     contexts = {
         input = elem("target:deps-base", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
-        source = elem("target:source", [sys_name, sys_version, sys_target])
+        source = elem("target:source-rust", [sys_name, sys_version, sys_target])
     }
     args = {
         cargo_args = ""
@@ -1632,7 +1687,7 @@ target "deps-base" {
         elem_tag("deps-base", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest")
     ]
     target = "cook"
-    output = ["type=cacheonly,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
+    output = ["type=cacheonly,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     dockerfile = "${docker_dir}/Dockerfile.cargo"
     matrix = cargo_rust_feat_sys
     inherits = [
@@ -1787,7 +1842,7 @@ target "rocksdb" {
         elem_tag("rocksdb", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
     target = "rocksdb"
-    output = ["type=cacheonly,compression=zstd,mode=min"]
+    output = ["type=cacheonly,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
     matrix = cargo_rust_feat_sys
     inherits = [
         elem("rocksdb-build", [cargo_profile, rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target])
@@ -1907,6 +1962,7 @@ target "ingredients" {
     tags = [
         elem_tag("ingredients", [rust_toolchain, rust_target, feat_set, sys_name, sys_version, sys_target], "latest"),
     ]
+    output = ["type=cacheonly,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     target =  "ingredients"
     dockerfile = "${docker_dir}/Dockerfile.source"
     matrix = rust_feat_sys
@@ -1936,6 +1992,20 @@ target "ingredients" {
         ZSTD_SYS_USE_PKG_CONFIG = (
             contains(split(",", cargo_feat_sets[feat_set]), "zstd_compression")? 1: 0
         )
+    }
+}
+
+# Compile-relevant subset of source.
+target "source-rust" {
+    name = elem("source-rust", [sys_name, sys_version, sys_target])
+    tags = [
+        elem_tag("source-rust", [sys_name, sys_version, sys_target], "latest")
+    ]
+    target =  "source-rust"
+    dockerfile = "${docker_dir}/Dockerfile.source"
+    matrix = sys
+    contexts = {
+        source = elem("target:source", [sys_name, sys_version, sys_target])
     }
 }
 
@@ -2248,7 +2318,7 @@ target "system" {
         elem_tag("system", [sys_name, sys_version, sys_target], "latest"),
     ]
     target = "system"
-    output = ["type=cacheonly,compression=zstd,mode=min,compression-level=${cache_compress_level}"]
+    output = ["type=cacheonly,compression=zstd,mode=max,compression-level=${cache_compress_level}"]
     dockerfile = "${docker_dir}/Dockerfile.system"
     context = "."
     matrix = sys

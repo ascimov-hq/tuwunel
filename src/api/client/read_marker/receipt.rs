@@ -3,16 +3,17 @@ use std::collections::BTreeMap;
 use axum::extract::State;
 use ruma::{
 	MilliSecondsSinceUnixEpoch,
-	api::client::receipt::create_receipt,
+	api::client::receipt::create_receipt::{self, v3::ReceiptType as CreateReceiptType},
 	events::{
 		RoomAccountDataEventType,
 		fully_read::{FullyReadEvent, FullyReadEventContent},
 		receipt::{Receipt, ReceiptEvent, ReceiptEventContent, ReceiptThread, ReceiptType},
 	},
-	presence::PresenceState,
 };
-use tuwunel_core::{Err, PduCount, Result, err};
+use tuwunel_core::{Err, Result, utils::result::LogErr};
+use tuwunel_service::presence::Ping;
 
+use super::set_private_marker;
 use crate::{ClientIp, Ruma};
 
 /// # `POST /_matrix/client/r0/rooms/{roomId}/receipt/{receiptType}/{eventId}`
@@ -26,7 +27,7 @@ pub(crate) async fn create_receipt_route(
 	let sender_user = body.sender_user();
 
 	// MSC3771: thread_id MUST NOT be provided with `m.fully_read`.
-	if matches!(&body.receipt_type, create_receipt::v3::ReceiptType::FullyRead)
+	if matches!(&body.receipt_type, CreateReceiptType::FullyRead)
 		&& !matches!(body.thread, ReceiptThread::Unthreaded)
 	{
 		return Err!(Request(InvalidParam(
@@ -69,18 +70,8 @@ pub(crate) async fn create_receipt_route(
 		}
 	}
 
-	if matches!(
-		&body.receipt_type,
-		create_receipt::v3::ReceiptType::Read | create_receipt::v3::ReceiptType::ReadPrivate
-	) {
-		services
-			.pusher
-			.reset_notification_counts_for_thread(sender_user, &body.room_id, &body.thread)
-			.await;
-	}
-
-	match body.receipt_type {
-		| create_receipt::v3::ReceiptType::FullyRead => {
+	let advanced = match body.receipt_type {
+		| CreateReceiptType::FullyRead => {
 			let fully_read_event = FullyReadEvent {
 				content: FullyReadEventContent { event_id: body.event_id.clone() },
 			};
@@ -93,8 +84,10 @@ pub(crate) async fn create_receipt_route(
 					&serde_json::to_value(fully_read_event)?,
 				)
 				.await?;
+
+			false
 		},
-		| create_receipt::v3::ReceiptType::Read => {
+		| CreateReceiptType::Read => {
 			let receipt_content = BTreeMap::from_iter([(
 				body.event_id.clone(),
 				BTreeMap::from_iter([(
@@ -106,7 +99,7 @@ pub(crate) async fn create_receipt_route(
 				)]),
 			)]);
 
-			services
+			let advanced = services
 				.read_receipt
 				.readreceipt_update(sender_user, &body.room_id, &ReceiptEvent {
 					content: ReceiptEventContent(receipt_content),
@@ -114,41 +107,50 @@ pub(crate) async fn create_receipt_route(
 				})
 				.await;
 
-			services
-				.presence
-				.maybe_ping_presence(
-					sender_user,
-					body.sender_device.as_deref(),
-					Some(client),
-					&PresenceState::Online,
-				)
-				.await
-				.ok();
-		},
-		| create_receipt::v3::ReceiptType::ReadPrivate => {
-			let count = services
-				.timeline
-				.get_pdu_count(&body.event_id)
-				.await
-				.map_err(|_| err!(Request(NotFound("Event not found."))))?;
-
-			let PduCount::Normal(count) = count else {
-				return Err!(Request(InvalidParam(
-					"Event is a backfilled PDU and cannot be marked as read."
-				)));
+			let ping = Ping {
+				device_id: body.sender_device.as_deref(),
+				client_ip: Some(client),
+				appservice: body.appservice_info.as_ref(),
+				..Default::default()
 			};
 
 			services
-				.read_receipt
-				.private_read_set(&body.room_id, sender_user, count, &body.thread)
-				.await;
+				.presence
+				.maybe_ping_presence(sender_user, ping)
+				.await
+				.ok();
+
+			advanced
 		},
+		| CreateReceiptType::ReadPrivate =>
+			set_private_marker(
+				&services,
+				&body.room_id,
+				sender_user,
+				&body.event_id,
+				&body.thread,
+			)
+			.await?,
 		| _ => {
 			return Err!(Request(InvalidParam(warn!(
 				"Received unknown read receipt type: {}",
 				&body.receipt_type
 			))));
 		},
+	};
+
+	if advanced
+		&& services
+			.pusher
+			.reset_notification_counts_for_thread(sender_user, &body.room_id, &body.thread)
+			.await
+	{
+		services
+			.sending
+			.refresh_push_badge(sender_user)
+			.await
+			.log_err()
+			.ok();
 	}
 
 	Ok(create_receipt::v3::Response {})

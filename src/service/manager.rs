@@ -63,15 +63,17 @@ impl Manager {
 		),
 	)]
 	pub(super) async fn stop(&self) {
-		if let Some(manager) = self.manager.lock().await.take() {
-			debug!("Waiting for service manager...");
-			if let Err(e) = manager.await {
-				error!("Manager shutdown error: {e:?}");
-			}
+		let Some(manager) = self.manager.lock().await.take() else {
+			return;
+		};
+
+		debug!("Waiting for service manager...");
+		if let Err(e) = manager.await {
+			error!("Manager shutdown error: {e:?}");
 		}
 	}
 
-	#[tracing::instrument(name = "manager", level = "trace", skip_all)]
+	#[tracing::instrument(name = "manager", level = "trace", skip_all, err)]
 	pub(super) async fn start(self: Arc<Self>) -> Result {
 		let mut workers = self.workers.lock().await;
 
@@ -107,7 +109,6 @@ impl Manager {
 		name = "manager",
 		level = INFO_SPAN_LEVEL,
 		skip_all,
-		ret,
 		err,
 	)]
 	async fn worker(self: &Arc<Self>) -> Result {
@@ -126,7 +127,6 @@ impl Manager {
 		Ok(())
 	}
 
-	#[allow(clippy::unused_self)]
 	fn handle_abort(&self, _workers: &mut WorkersLocked<'_>, error: &Error) -> Result {
 		// not supported until service can be associated with abort
 		unimplemented!("unexpected worker task abort {error:?}");

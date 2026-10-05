@@ -1,7 +1,11 @@
-use std::{env, io, sync::LazyLock};
+use std::{
+	env, io,
+	io::{IsTerminal, stdin},
+	sync::LazyLock,
+};
 
 use tracing::{
-	Event, Level, Subscriber,
+	Event, Level, Metadata, Subscriber,
 	field::{Field, Visit},
 };
 use tracing_subscriber::{
@@ -14,35 +18,68 @@ use tracing_subscriber::{
 	registry::LookupSpan,
 };
 
+use super::journald::{Entry, Journal, enabled as journald_enabled};
 use crate::{Config, Result, apply, debug, is_equal_to};
 
 static SYSTEMD_MODE: LazyLock<bool> =
 	LazyLock::new(|| env::var("SYSTEMD_EXEC_PID").is_ok() && env::var("JOURNAL_STREAM").is_ok());
+
+static TERMINAL_MODE: LazyLock<bool> = LazyLock::new(|| stdin().is_terminal());
 
 pub struct ConsoleWriter {
 	stdout: io::Stdout,
 	stderr: io::Stderr,
 	_journal_stream: [u64; 2],
 	use_stderr: bool,
+	journal: Option<Journal>,
+}
+
+pub enum Sink<'a> {
+	Console(&'a ConsoleWriter),
+	Journal(Entry<'a>),
 }
 
 impl ConsoleWriter {
 	#[must_use]
 	pub fn new(config: &Config) -> Self {
 		let journal_stream = get_journal_stream();
+
 		Self {
 			stdout: io::stdout(),
 			stderr: io::stderr(),
 			_journal_stream: journal_stream.into(),
 			use_stderr: journal_stream.0 != 0 || config.log_to_stderr,
+			journal: Journal::open(config),
 		}
 	}
 }
 
 impl<'a> MakeWriter<'a> for ConsoleWriter {
-	type Writer = &'a Self;
+	type Writer = Sink<'a>;
 
-	fn make_writer(&'a self) -> Self::Writer { self }
+	fn make_writer(&'a self) -> Self::Writer { Sink::Console(self) }
+
+	fn make_writer_for(&'a self, meta: &Metadata<'_>) -> Self::Writer {
+		self.journal
+			.as_ref()
+			.map_or(Sink::Console(self), |journal| Sink::Journal(journal.entry(meta)))
+	}
+}
+
+impl io::Write for Sink<'_> {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		match self {
+			| Self::Console(console) => console.write(buf),
+			| Self::Journal(entry) => entry.write(buf),
+		}
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		match self {
+			| Self::Console(console) => console.flush(),
+			| Self::Journal(entry) => entry.flush(),
+		}
+	}
 }
 
 impl io::Write for &'_ ConsoleWriter {
@@ -73,10 +110,12 @@ pub struct ConsoleFormat {
 impl ConsoleFormat {
 	#[must_use]
 	pub fn new(config: &Config) -> Self {
+		let ansi = ansi_enabled(config);
+
 		Self {
 			pretty: fmt::format()
 				.pretty()
-				.with_ansi(config.log_colors)
+				.with_ansi(ansi)
 				.with_thread_names(true)
 				.with_thread_ids(true)
 				.with_target(true)
@@ -86,11 +125,9 @@ impl ConsoleFormat {
 
 			full: Format::<Full>::default()
 				.with_thread_ids(config.log_thread_ids)
-				.with_ansi(config.log_colors),
+				.with_ansi(ansi),
 
-			compact: fmt::format()
-				.compact()
-				.with_ansi(config.log_colors),
+			compact: fmt::format().compact().with_ansi(ansi),
 
 			compact_mode: config.log_compact,
 		}
@@ -163,6 +200,24 @@ fn get_journal_stream() -> (u64, u64) {
 		.unwrap_or((0, 0))
 }
 
+/// Whether to color the formatted line.
+///
+/// The journal takes that line verbatim and classifies a message carrying
+/// control bytes as binary rather than text, so colors are suppressed while
+/// entries are submitted to it.
+#[inline]
+#[must_use]
+pub fn ansi_enabled(config: &Config) -> bool { config.log_colors && !journald_enabled(config) }
+
+/// Whether the process was started by systemd, sampled once.
+///
+/// Both `SYSTEMD_EXEC_PID` and `JOURNAL_STREAM` have to be present, which the
+/// service manager sets for a unit it launched itself.
 #[inline]
 #[must_use]
 pub fn is_systemd_mode() -> bool { *SYSTEMD_MODE }
+
+/// Whether standard input is attached to a terminal, sampled once.
+#[inline]
+#[must_use]
+pub fn is_terminal_mode() -> bool { *TERMINAL_MODE }

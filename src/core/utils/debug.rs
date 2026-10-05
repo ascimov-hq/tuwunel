@@ -1,31 +1,35 @@
+//! Bounded and redacted debug-formatting utilities.
+//!
+//! The wrappers cap debug output from slices and strings before values enter
+//! tracing fields. The exported macro reports optional presence without
+//! exposing contents.
+
 use std::fmt;
 
-/// Debug-formats the given slice, but only up to the first `max_len` elements.
-/// Any further elements are replaced by an ellipsis.
+/// Wraps a slice for length-limited `Debug` output.
 ///
-/// See also [`slice_truncated()`],
+/// Slices at or below `max_len` keep ordinary slice formatting. Longer slices
+/// show the first `max_len` elements followed by a quoted `"..."` list entry.
 pub struct TruncatedSlice<'a, T> {
 	inner: &'a [T],
 	max_len: usize,
 }
 
-/// Debug-formats the given str, but only up to the first `max_len` elements.
-/// Any further elements are replaced by an ellipsis.
+/// Wraps a UTF-8 string for threshold-limited `Debug` output.
 ///
-/// See also [`str_truncated()`],
+/// Strings no longer than `max_len` bytes keep ordinary quoted formatting.
+/// Longer strings end at the first scalar boundary at or after `max_len`, then
+/// append `...` outside the closing quote. Formatting panics if `max_len` lies
+/// within the final multibyte scalar because no later boundary exists.
 pub struct TruncatedStr<'a> {
 	inner: &'a str,
 	max_len: usize,
 }
 
-/// See [`TruncatedSlice`]. Useful for `#[instrument]`:
+/// Creates a tracing debug value that truncates a slice.
 ///
-/// ```
-/// use tuwunel_core::utils::debug::slice_truncated;
-///
-/// #[tracing::instrument(fields(foos = slice_truncated(foos, 42)))]
-/// fn bar(foos: &[&str]) {}
-/// ```
+/// The returned value can be recorded directly in a structured tracing field.
+/// At most `max_len` slice elements are formatted before the ellipsis marker.
 pub fn slice_truncated<T: fmt::Debug>(
 	slice: &[T],
 	max_len: usize,
@@ -33,19 +37,22 @@ pub fn slice_truncated<T: fmt::Debug>(
 	tracing::field::debug(TruncatedSlice { inner: slice, max_len })
 }
 
-/// See [`TruncatedStr`]. Useful for `#[instrument]`:
+/// Creates a tracing debug value that truncates a string.
 ///
-/// ```
-/// use tuwunel_core::utils::debug::str_truncated;
-///
-/// #[tracing::instrument(fields(foos = str_truncated(foos, 42)))]
-/// fn bar(foos: &str) {}
-/// ```
+/// The returned value can be recorded directly in a structured tracing field.
+/// Truncation uses a byte threshold and ends at the first following UTF-8
+/// boundary. Formatting panics if the threshold lies within the final
+/// multibyte scalar.
 #[must_use]
 pub fn str_truncated(s: &str, max_len: usize) -> tracing::field::DebugValue<TruncatedStr<'_>> {
 	tracing::field::debug(TruncatedStr { inner: s, max_len })
 }
 
+/// Produces a debug label for an optional value without revealing its contents.
+///
+/// The macro expands to `"Some(<redacted>)"` when the identifier reports a
+/// present value and to `"None"` otherwise. Its argument must be an identifier
+/// supporting an `is_some` method.
 #[macro_export]
 macro_rules! redacted_debug {
 	($f:ident) => {

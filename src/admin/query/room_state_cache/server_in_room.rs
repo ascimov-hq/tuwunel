@@ -9,10 +9,10 @@ pub(super) async fn server_in_room(
 	server: OwnedServerName,
 	room_id: OwnedRoomId,
 ) -> Result {
-	self.write_timed_query(
-		self.services
-			.state_cache
-			.server_in_room(&server, &room_id),
-	)
-	.await
+	let query = self
+		.services
+		.state_cache
+		.server_in_room(&server, &room_id);
+
+	self.write_timed_query(query).await
 }

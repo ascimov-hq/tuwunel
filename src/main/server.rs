@@ -1,15 +1,17 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{iter::empty, sync::Arc};
 
 use tokio::sync::Mutex;
 use tuwunel_core::{
-	Error, Result,
-	config::Config,
+	Error, Result, Server as CoreServer,
+	config::{Config, Figment, Sources},
 	implement, info,
 	metrics::Metrics,
 	utils::{stream, sys},
 };
 
-use crate::{Args, Runtime, args, logging::TracingFlameGuard, runtime::Handle};
+use crate::{
+	Args, Runtime, args::update as update_config, logging::TracingFlameGuard, runtime::Handle,
+};
 
 /// Server runtime state; complete
 pub struct Server {
@@ -42,15 +44,11 @@ pub fn new(args: Option<&Args>, runtime: Option<&Runtime>) -> Result<Arc<Self>, 
 		.map(Runtime::metrics)
 		.unwrap_or_else(|| Metrics::new(None));
 
-	let config_paths = args
-		.config
-		.as_deref()
-		.into_iter()
-		.flat_map(<[_]>::iter)
-		.map(PathBuf::as_path);
+	let config_sources = config_sources(args);
 
-	let config = Config::load(config_paths)
-		.and_then(|raw| args::update(raw, args))
+	let config = config_sources
+		.load(empty())
+		.map(|raw| with_restore(raw, args))
 		.and_then(|raw| Config::new(&raw))?;
 
 	let (tracing_flame_guard, logger) = crate::logging::init(&config)?;
@@ -76,7 +74,7 @@ pub fn new(args: Option<&Args>, runtime: Option<&Runtime>) -> Result<Arc<Self>, 
 	);
 
 	Ok(Arc::new(Self {
-		server: Arc::new(tuwunel_core::Server::new(config, handle, logger, metrics)),
+		server: Arc::new(CoreServer::new(config, config_sources, handle, logger, metrics)),
 
 		services: None.into(),
 
@@ -88,4 +86,83 @@ pub fn new(args: Option<&Args>, runtime: Option<&Runtime>) -> Result<Arc<Self>, 
 		#[cfg(all(tuwunel_mods, feature = "tuwunel_mods"))]
 		mods: tokio::sync::RwLock::new(Vec::new()),
 	}))
+}
+
+pub(crate) fn config_sources(args: &Args) -> Sources {
+	// Taken out of the retained copy rather than cloned beside it, so the paths
+	// have one home.
+	let mut cli = args.clone();
+	let paths = cli.config.take().unwrap_or_default();
+
+	cli.restore_backup = None;
+
+	Sources {
+		paths,
+		overrides: Some(Box::new(move |raw| update_config(raw, &cli))),
+	}
+}
+
+/// Applied outside the retained sources, and so not replayed on reload, since
+/// restoring is one-shot for the invocation which asked for it.
+fn with_restore(raw: Figment, args: &Args) -> Figment {
+	match args.restore_backup {
+		| None => raw,
+		| Some(backup_id) => raw.join(("database_restore_backup", backup_id)),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::path::PathBuf;
+
+	use clap::Parser;
+	use tuwunel_core::config::Figment;
+
+	use super::{Args, config_sources, with_restore};
+
+	fn args(argv: &[&str]) -> Args { Args::parse_from(argv) }
+
+	#[test]
+	fn startup_carries_the_restore_flag() {
+		let raw = with_restore(Figment::new(), &args(&["tuwunel", "--restore-backup", "5"]));
+
+		raw.find_value("database_restore_backup")
+			.expect("the startup configuration carries it");
+	}
+
+	#[test]
+	fn a_reload_does_not_replay_the_restore_flag() {
+		let sources = config_sources(&args(&["tuwunel", "--restore-backup", "5"]));
+		let overrides = sources.overrides.as_ref().expect("installed");
+
+		overrides(Figment::new())
+			.expect("applies")
+			.find_value("database_restore_backup")
+			.expect_err("a reload does not restore again");
+	}
+
+	#[test]
+	fn a_reload_replays_the_other_overrides() {
+		let sources =
+			config_sources(&args(&["tuwunel", "-O", r#"server_name="pinned.example""#]));
+		let overrides = sources.overrides.as_ref().expect("installed");
+
+		let replayed = overrides(Figment::new()).expect("applies");
+
+		assert_eq!(
+			replayed
+				.find_value("server_name")
+				.expect("present")
+				.into_string()
+				.as_deref(),
+			Some("pinned.example"),
+		);
+	}
+
+	#[test]
+	fn config_paths_are_retained() {
+		let sources = config_sources(&args(&["tuwunel", "-c", "/etc/tuwunel/tuwunel.toml"]));
+
+		assert_eq!(sources.paths, [PathBuf::from("/etc/tuwunel/tuwunel.toml")]);
+	}
 }

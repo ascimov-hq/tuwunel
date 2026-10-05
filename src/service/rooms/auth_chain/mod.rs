@@ -21,7 +21,7 @@ use tuwunel_core::{
 	matrix::room_version,
 	pdu::AuthEvents,
 	smallvec::SmallVec,
-	trace, utils,
+	trace,
 	utils::{
 		IterStream,
 		stream::{BroadbandExt, ReadyExt, TryExpect, automatic_width},
@@ -212,7 +212,7 @@ where
 	self.get_cached_auth_chain(starting_events.clone().map(at!(0)))
 		.map_ok(IntoIterator::into_iter)
 		.map_ok(IterStream::try_stream)
-		.or_else(move |_| async move {
+		.or_else(async move |_| {
 			starting_events
 				.clone()
 				.stream()
@@ -307,6 +307,9 @@ pub fn get_event_auth_chain_ids<'a>(
 		(out, state)
 	};
 
+	// unfold requires FnMut returning a nameable future; an async closure
+	// capturing eval does not satisfy it.
+	#[expect(closure_returning_async_block)]
 	unfold(state, move |mut state| async move {
 		match state.todo.next().await {
 			| None => None,
@@ -378,8 +381,11 @@ where
 				.await
 		})
 		.await?
-		.chunks_exact(size_of::<u64>())
-		.map(utils::u64_from_u8)
+		.as_chunks::<{ size_of::<u64>() }>()
+		.0
+		.iter()
+		.copied()
+		.map(u64::from_be_bytes)
 		.collect();
 
 	Ok(chain)

@@ -12,7 +12,8 @@ use ruma::{
 	},
 };
 use tuwunel_core::{
-	Err, Event, PduCount, Result, at, debug, debug_info, debug_warn, err, implement, info,
+	Err, Event, PduCount, Result, async_noinline, at, debug, debug_info, debug_warn, err,
+	implement, info,
 	matrix::event::gen_event_id,
 	pdu::{PduBuilder, PduEvent},
 	trace, utils, warn,
@@ -30,19 +31,21 @@ use crate::{
 };
 
 #[implement(Service)]
+#[async_noinline]
 #[tracing::instrument(
+	name = "knock",
 	level = "debug",
 	skip_all,
 	fields(%sender_user, %room_id)
 )]
-pub async fn knock(
-	&self,
-	sender_user: &UserId,
-	room_id: &RoomId,
-	orig_server_name: Option<&RoomOrAliasId>,
+pub async fn knock<'a>(
+	&'a self,
+	sender_user: &'a UserId,
+	room_id: &'a RoomId,
+	orig_server_name: Option<&'a RoomOrAliasId>,
 	reason: Option<String>,
-	servers: &[OwnedServerName],
-	state_lock: &RoomMutexGuard,
+	servers: &'a [OwnedServerName],
+	state_lock: &'a RoomMutexGuard,
 ) -> Result {
 	let servers =
 		get_servers_for_room(&self.services, sender_user, room_id, orig_server_name, servers)
@@ -132,8 +135,14 @@ async fn knock_room_helper_local(
 
 	ensure_room_version_supports_knock(&room_version_id)?;
 
-	let content = self
-		.build_knock_member_content(sender_user, reason.clone())
+	let mut content = RoomMemberEventContent {
+		reason: reason.clone(),
+		..RoomMemberEventContent::new(MembershipState::Knock)
+	};
+
+	self.services
+		.profile
+		.fill_profile_data(sender_user, &mut content)
 		.await;
 
 	let Err(error) = self
@@ -177,36 +186,6 @@ fn ensure_room_version_supports_knock(room_version_id: &RoomVersionId) -> Result
 	}
 
 	Ok(())
-}
-
-#[implement(Service)]
-async fn build_knock_member_content(
-	&self,
-	sender_user: &UserId,
-	reason: Option<String>,
-) -> RoomMemberEventContent {
-	RoomMemberEventContent {
-		displayname: self
-			.services
-			.users
-			.displayname(sender_user)
-			.await
-			.ok(),
-		avatar_url: self
-			.services
-			.users
-			.avatar_url(sender_user)
-			.await
-			.ok(),
-		blurhash: self
-			.services
-			.users
-			.blurhash(sender_user)
-			.await
-			.ok(),
-		reason,
-		..RoomMemberEventContent::new(MembershipState::Knock)
-	}
 }
 
 #[implement(Service)]
@@ -430,8 +409,14 @@ async fn build_knock_event(
 			err!(BadServerResponse("Invalid make_knock event json received from server: {e:?}"))
 		})?;
 
-	let content = self
-		.build_knock_member_content(sender_user, reason)
+	let mut content = RoomMemberEventContent {
+		reason,
+		..RoomMemberEventContent::new(MembershipState::Knock)
+	};
+
+	self.services
+		.profile
+		.fill_profile_data(sender_user, &mut content)
 		.await;
 
 	knock_event_stub.insert(

@@ -245,13 +245,9 @@ async fn issue_tokens(services: &Services, grant: ApprovedGrant<'_>) -> Result<R
 		)
 		.await?;
 
-	// Tag the device with the IdP that authenticated it, falling back to the
-	// default; leave the row absent when no provider exists.
-	let idp_id = idp_id
-		.filter(|idp| !idp.is_empty())
-		.or_else(|| services.oauth.providers.get_default_id());
-
-	if let Some(idp_id) = idp_id {
+	// Tag the device with the IdP that authenticated it; a native (local
+	// account) grant carries no provider, so the device stays untagged.
+	if let Some(idp_id) = idp_id.filter(|idp| !idp.is_empty()) {
 		services
 			.users
 			.mark_oidc_device(user_id, &device_id, &idp_id);

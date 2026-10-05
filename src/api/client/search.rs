@@ -286,6 +286,14 @@ where
 	pdus.ignore_err()
 		.wide_filter_map(|item| visibility_filter(services, item, sender_user))
 		.take(take)
+		.wide_then(async |(count, pdu)| {
+			let pdu = services
+				.pdu_metadata
+				.bundle_aggregations(sender_user, pdu)
+				.await;
+
+			(count, pdu)
+		})
 		.collect()
 		.await
 }

@@ -1,19 +1,24 @@
-use std::{borrow::Borrow, mem::size_of_val, sync::Arc};
+use std::{borrow::Borrow, sync::Arc};
 
 use futures::{FutureExt, Stream, StreamExt, pin_mut};
-use ruma::{EventId, OwnedRoomId, RoomId, events::StateEventType};
+use ruma::{EventId, OwnedEventId, OwnedRoomId, RoomId, events::StateEventType};
 use serde::Deserialize;
 pub use tuwunel_core::matrix::{ShortEventId, ShortId, ShortRoomId, ShortStateKey};
 use tuwunel_core::{
 	Err, Result, err, implement,
 	matrix::StateKey,
 	utils,
-	utils::{IterStream, stream::ReadyExt},
+	utils::{
+		IterStream, MutexMap,
+		hash::sha256::Digest,
+		stream::{ReadyExt, WidebandExt},
+	},
 };
-use tuwunel_database::{Deserialized, Get, Map, Qry};
+use tuwunel_database::{Deserialized, Get, Map, Qry, Txn};
 
 pub struct Service {
 	db: Data,
+	creating: Creating,
 	services: Arc<crate::services::OnceServices>,
 }
 
@@ -24,6 +29,20 @@ struct Data {
 	shortstatekey_statekey: Arc<Map>,
 	roomid_shortroomid: Arc<Map>,
 	statehash_shortstatehash: Arc<Map>,
+}
+
+/// Serializes concurrent allocations so one identity maps to one short id.
+///
+/// A guard is held across both the re-read that detects a competing
+/// allocation and the writes that publish this one. Entries exist only while
+/// a caller holds or awaits one, so an uncontended allocation leaves nothing
+/// behind.
+#[derive(Default)]
+struct Creating {
+	shorteventid: MutexMap<OwnedEventId, ()>,
+	shortstatekey: MutexMap<(StateEventType, StateKey), ()>,
+	shortstatehash: MutexMap<Digest, ()>,
+	shortroomid: MutexMap<OwnedRoomId, ()>,
 }
 
 pub type ShortStateHash = ShortId;
@@ -39,6 +58,7 @@ impl crate::Service for Service {
 				roomid_shortroomid: args.db["roomid_shortroomid"].clone(),
 				statehash_shortstatehash: args.db["statehash_shortstatehash"].clone(),
 			},
+			creating: Creating::default(),
 			services: args.services.clone(),
 		}))
 	}
@@ -52,9 +72,14 @@ pub async fn get_or_create_shorteventid(&self, event_id: &EventId) -> ShortEvent
 		return shorteventid;
 	}
 
-	self.create_shorteventid(event_id)
+	self.create_shorteventid(event_id).await
 }
 
+/// Resolves each event id to its short id, allocating any that are absent.
+///
+/// Allocation runs ahead of consumer demand, so a caller that stops early
+/// still allocates for the events already buffered. Today's callers drain the
+/// stream in full.
 #[implement(Service)]
 pub fn multi_get_or_create_shorteventid<'a, I>(
 	&'a self,
@@ -68,26 +93,26 @@ where
 		.stream()
 		.get(&self.db.eventid_shorteventid)
 		.zip(event_ids.into_iter().stream())
-		.map(|(result, event_id)| match result {
+		.wide_then(async |(result, event_id)| match result {
 			| Ok(ref short) => utils::u64_from_u8(short),
-			| Err(_) => self.create_shorteventid(event_id),
+			| Err(_) => self.create_shorteventid(event_id).await,
 		})
 }
 
 #[implement(Service)]
-fn create_shorteventid(&self, event_id: &EventId) -> ShortEventId {
-	const BUFSIZE: usize = size_of::<ShortEventId>();
+async fn create_shorteventid(&self, event_id: &EventId) -> ShortEventId {
+	let _lock = self.creating.shorteventid.lock(event_id).await;
+
+	if let Ok(shorteventid) = self.get_shorteventid(event_id).await {
+		return shorteventid;
+	}
 
 	let short = self.services.globals.next_count();
-	debug_assert!(size_of_val(&*short) == BUFSIZE, "buffer requirement changed");
+	let mut txn = self.services.db.txn();
 
-	self.db
-		.eventid_shorteventid
-		.raw_aput::<BUFSIZE, _, _>(event_id, *short);
-
-	self.db
-		.shorteventid_eventid
-		.aput_raw::<BUFSIZE, _, _>(*short, event_id);
+	txn.insert_raw(&self.db.shorteventid_eventid, (*short).to_be_bytes(), event_id);
+	txn.insert_raw(&self.db.eventid_shorteventid, event_id, (*short).to_be_bytes());
+	txn.execute();
 
 	*short
 }
@@ -107,7 +132,25 @@ pub async fn get_or_create_shortstatekey(
 	event_type: &StateEventType,
 	state_key: &str,
 ) -> ShortStateKey {
-	const BUFSIZE: usize = size_of::<ShortStateKey>();
+	if let Ok(shortstatekey) = self
+		.get_shortstatekey(event_type, state_key)
+		.await
+	{
+		return shortstatekey;
+	}
+
+	self.create_shortstatekey(event_type, state_key)
+		.await
+}
+
+#[implement(Service)]
+async fn create_shortstatekey(
+	&self,
+	event_type: &StateEventType,
+	state_key: &str,
+) -> ShortStateKey {
+	let owned_key = (event_type.clone(), StateKey::from_str(state_key));
+	let _lock = self.creating.shortstatekey.lock(&owned_key).await;
 
 	if let Ok(shortstatekey) = self
 		.get_shortstatekey(event_type, state_key)
@@ -118,16 +161,11 @@ pub async fn get_or_create_shortstatekey(
 
 	let key = (event_type, state_key);
 	let shortstatekey = self.services.globals.next_count();
+	let mut txn = self.services.db.txn();
 
-	debug_assert!(size_of_val(&*shortstatekey) == BUFSIZE, "buffer requirement changed");
-
-	self.db
-		.statekey_shortstatekey
-		.put_aput::<BUFSIZE, _, _>(key, *shortstatekey);
-
-	self.db
-		.shortstatekey_statekey
-		.aput_put::<BUFSIZE, _, _>(*shortstatekey, key);
+	txn.put(&self.db.shortstatekey_statekey, *shortstatekey, key);
+	txn.put(&self.db.statekey_shortstatekey, key, *shortstatekey);
+	txn.execute();
 
 	*shortstatekey
 }
@@ -211,27 +249,62 @@ where
 
 /// Returns (shortstatehash, already_existed)
 #[implement(Service)]
-pub async fn get_or_create_shortstatehash(&self, state_hash: &[u8]) -> (ShortStateHash, bool) {
-	const BUFSIZE: usize = size_of::<ShortStateHash>();
+pub async fn get_or_create_shortstatehash<F>(
+	&self,
+	state_hash: &Digest,
+	write_statediff: F,
+) -> Result<(ShortStateHash, bool)>
+where
+	F: FnOnce(&mut Txn, ShortStateHash) -> Result,
+{
+	if let Ok(shortstatehash) = self.get_shortstatehash(state_hash).await {
+		return Ok((shortstatehash, true));
+	}
 
-	if let Ok(shortstatehash) = self
-		.db
+	self.create_shortstatehash(state_hash, write_statediff)
+		.await
+}
+
+#[implement(Service)]
+async fn create_shortstatehash<F>(
+	&self,
+	state_hash: &Digest,
+	write_statediff: F,
+) -> Result<(ShortStateHash, bool)>
+where
+	F: FnOnce(&mut Txn, ShortStateHash) -> Result,
+{
+	let _lock = self
+		.creating
+		.shortstatehash
+		.lock(state_hash)
+		.await;
+
+	if let Ok(shortstatehash) = self.get_shortstatehash(state_hash).await {
+		return Ok((shortstatehash, true));
+	}
+
+	let shortstatehash = self.services.globals.next_count();
+	let mut txn = self.services.db.txn();
+
+	txn.insert_raw(
+		&self.db.statehash_shortstatehash,
+		state_hash,
+		(*shortstatehash).to_be_bytes(),
+	);
+	write_statediff(&mut txn, *shortstatehash)?;
+	txn.execute();
+
+	Ok((*shortstatehash, false))
+}
+
+#[implement(Service)]
+pub async fn get_shortstatehash(&self, state_hash: &Digest) -> Result<ShortStateHash> {
+	self.db
 		.statehash_shortstatehash
 		.get(state_hash)
 		.await
 		.deserialized()
-	{
-		return (shortstatehash, true);
-	}
-
-	let shortstatehash = self.services.globals.next_count();
-	debug_assert!(size_of_val(&*shortstatehash) == BUFSIZE, "buffer requirement changed");
-
-	self.db
-		.statehash_shortstatehash
-		.raw_aput::<BUFSIZE, _, _>(state_hash, *shortstatehash);
-
-	(*shortstatehash, false)
 }
 
 #[implement(Service)]
@@ -261,23 +334,32 @@ pub async fn get_roomid_from_short(&self, shortroomid_: ShortRoomId) -> Result<O
 
 #[implement(Service)]
 pub async fn get_or_create_shortroomid(&self, room_id: &RoomId) -> ShortRoomId {
+	if let Ok(shortroomid) = self.get_shortroomid(room_id).await {
+		return shortroomid;
+	}
+
+	self.create_shortroomid(room_id).await
+}
+
+#[implement(Service)]
+async fn create_shortroomid(&self, room_id: &RoomId) -> ShortRoomId {
+	const BUFSIZE: usize = size_of::<ShortRoomId>();
+
+	let _lock = self.creating.shortroomid.lock(room_id).await;
+
+	if let Ok(shortroomid) = self.get_shortroomid(room_id).await {
+		return shortroomid;
+	}
+
+	let short = self.services.globals.next_count();
+
+	debug_assert!(size_of_val(&*short) == BUFSIZE, "buffer requirement changed");
+
 	self.db
 		.roomid_shortroomid
-		.get(room_id)
-		.await
-		.deserialized()
-		.unwrap_or_else(|_| {
-			const BUFSIZE: usize = size_of::<ShortRoomId>();
+		.raw_aput::<BUFSIZE, _, _>(room_id, *short);
 
-			let short = self.services.globals.next_count();
-			debug_assert!(size_of_val(&*short) == BUFSIZE, "buffer requirement changed");
-
-			self.db
-				.roomid_shortroomid
-				.raw_aput::<BUFSIZE, _, _>(room_id, *short);
-
-			*short
-		})
+	*short
 }
 
 #[implement(Service)]

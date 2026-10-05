@@ -5,6 +5,7 @@ pub mod manager;
 mod net;
 pub mod proxy;
 pub mod room_version;
+pub mod sources;
 #[cfg(test)]
 mod tests;
 pub mod well_known;
@@ -31,7 +32,7 @@ use serde::{Deserialize, de::IgnoredAny};
 use tuwunel_macros::config_example_generator;
 use url::Url;
 
-pub use self::{check::check, ip_source::IpSource, manager::Manager};
+pub use self::{check::check, ip_source::IpSource, manager::Manager, sources::Sources};
 use self::{
 	net::{ListeningAddr, ListeningPort},
 	proxy::ProxyConfig,
@@ -66,7 +67,7 @@ use crate::{
 ### https://tuwunel.chat/configuration.html
 "#,
 	ignore = "catchall well_known tls allow_invalid_tls_certificates ldap jwt appservice \
-	          identity_provider storage_provider registration_terms smtp"
+	          identity_provider storage_provider registration_terms smtp database_restore_backup"
 )]
 pub struct Config {
 	/// The server_name is the pretty name of this server. It is used as a
@@ -114,6 +115,10 @@ pub struct Config {
 	///
 	/// To listen on multiple addresses, specify a vector e.g. ["127.0.0.1",
 	/// "::1"]
+	///
+	/// An address set here must bind or the server refuses to start. The
+	/// default is only a guess that both loopback families exist, so one of
+	/// them failing to bind is logged and skipped instead.
 	///
 	/// default: ["127.0.0.1", "::1"]
 	#[serde(default)]
@@ -173,12 +178,21 @@ pub struct Config {
 	pub database_backup_path: Option<PathBuf>,
 
 	/// The amount of online RocksDB database backups to keep/retain, if using
-	/// "database_backup_path", before deleting the oldest one.
+	/// "database_backup_path", before deleting the oldest one. This must be at
+	/// least 1; "backup-database" is an error at 0 or below.
 	///
 	/// reloadable: yes
 	/// default: 1
 	#[serde(default = "default_database_backups_to_keep")]
 	pub database_backups_to_keep: i16,
+
+	/// Restore this online database backup on startup, before the database is
+	/// opened. The value is a backup ID as listed by `!admin server
+	/// list-backups`, or 0 for the most recent backup. Set by the
+	/// `--restore-backup` command line argument, and refused from a
+	/// configuration file, where it would repeat the restore on every
+	/// startup.
+	pub database_restore_backup: Option<u32>,
 
 	/// Set this to any float value to multiply tuwunel's in-memory LRU caches
 	/// with such as "auth_chain_cache_capacity".
@@ -270,7 +284,7 @@ pub struct Config {
 	/// cache.
 	///
 	/// reloadable: yes
-	/// default: 21600
+	/// default: 10800
 	#[serde(default = "default_spacehierarchy_cache_ttl_min")]
 	pub spacehierarchy_cache_ttl_min: u64,
 
@@ -278,7 +292,7 @@ pub struct Config {
 	/// cache.
 	///
 	/// reloadable: yes
-	/// default: 129600
+	/// default: 64800
 	#[serde(default = "default_spacehierarchy_cache_ttl_max")]
 	pub spacehierarchy_cache_ttl_max: u64,
 
@@ -305,6 +319,87 @@ pub struct Config {
 	/// default: 90000
 	#[serde(default = "default_client_sync_timeout_max")]
 	pub client_sync_timeout_max: u64,
+
+	/// After a long-polling legacy /sync is woken by activity, wait this many
+	/// milliseconds (never past the request's timeout) before rebuilding the
+	/// response, so a burst of writes across many rooms (e.g. a bridge import)
+	/// produces one rebuild instead of one per wakeup. 0 disables the wait.
+	///
+	/// reloadable: yes
+	/// default: 0
+	#[serde(default)]
+	pub sync_wake_debounce_ms: u64,
+
+	/// Leave joined rooms out of incremental legacy /sync responses when they
+	/// carry nothing the client's filter asked for: no timeline events, state,
+	/// ephemeral events or account data. Without this a room is still sent for
+	/// e.g. the unchanged unread counts of a room the user never read, or a
+	/// `limited` flag on a timeline the filter excludes entirely, which keeps
+	/// long-polls (such as a bridge bot filtering `not_types: ["*"]`) from
+	/// waiting. Newly joined rooms, initial and full-state syncs, and rooms
+	/// whose read position moved are always sent. A change seen only in the
+	/// room summary (member counts) or in notification counts raised by events
+	/// the filter excludes is not sent on its own; it arrives with the room's
+	/// next reported change.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub sync_omit_empty_rooms: bool,
+
+	/// Honour `lazy_load_members` in encrypted rooms on legacy /sync. By default
+	/// it is ignored there because device-list changes were derived from the
+	/// lazily trimmed member state; with this enabled they are derived from
+	/// the untrimmed member changes instead. Clients that opt in must load the
+	/// member list (e.g. /members) before encrypting to a room. Clients that do
+	/// not request lazy loading are unaffected.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub lazy_load_encrypted_rooms: bool,
+
+	/// Treat the `to` token of /messages as an exclusive bound which stops
+	/// pagination at the first event at or beyond it. By default pagination
+	/// stops only on an event whose position equals `to` exactly, so a `to`
+	/// taken from /sync (a global position) often walks past the gap it was
+	/// meant to fill. Enable only once clients no longer depend on the old
+	/// behaviour.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub messages_clamp_to_token: bool,
+
+	/// Enable the Beeper batch-send endpoint for appservices
+	/// (`POST /_matrix/client/unstable/com.beeper.backfill/rooms/{roomId}/batch_send`)
+	/// and advertise `com.beeper.batch_sending` in /versions. Only forward
+	/// batches are supported: events are appended at the end of the room in
+	/// the given order and the server-assigned event IDs are returned in the
+	/// same order. Senders must be joined to the room and be in the calling
+	/// appservice's namespace or, for double puppeting, be local users covered
+	/// by a URL-less appservice registration (whose token bridges hold) and
+	/// not claimed exclusively by any appservice; `mark_read_by` follows the
+	/// same rule. The room must belong to the calling appservice: its bot is
+	/// joined, or the bot or a user in its exclusive namespace created the
+	/// room.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub beeper_batch_send: bool,
+
+	/// Custom DNS servers to query instead of the operating system's default
+	/// resolvers; when this list is non-empty, `/etc/resolv.conf` is never
+	/// read. Each entry is an IP address with an optional port, defaulting to
+	/// port 53. The servers are assumed to support both UDP and TCP on that
+	/// port; enable `query_over_tcp_only` if any of them is TCP-only.
+	///
+	/// example: ["127.0.0.53", "1.1.1.1:5353", "[fd00::1]:53"]
+	///
+	/// default: []
+	#[serde(default)]
+	pub dns_servers: Vec<String>,
 
 	/// Maximum entries stored in DNS memory-cache. The size of an entry may
 	/// vary so please take care if raising this value excessively. Only
@@ -488,7 +583,7 @@ pub struct Config {
 	pub media_rc_create_burst_count: u32,
 
 	/// reloadable: yes
-	/// default: 192
+	/// default: 1024
 	#[serde(default = "default_max_fetch_prev_events")]
 	pub max_fetch_prev_events: u16,
 
@@ -594,11 +689,11 @@ pub struct Config {
 	#[serde(default = "default_well_known_timeout")]
 	pub well_known_timeout: u64,
 
-	/// Federation client request timeout (seconds). You most definitely want
-	/// this to be high to account for extremely large room joins, slow
-	/// homeservers, your own resources etc.
+	/// Federation client request timeout (seconds). This applies to each read
+	/// from the remote server rather than to the request as a whole, which
+	/// remains bounded by `request_total_timeout`.
 	///
-	/// default: 300
+	/// default: 25
 	#[serde(default = "default_federation_timeout")]
 	pub federation_timeout: u64,
 
@@ -647,6 +742,17 @@ pub struct Config {
 	#[serde(default = "default_sender_retry_backoff_limit")]
 	pub sender_retry_backoff_limit: u64,
 
+	/// Grace period (seconds) before the first retry of a federation
+	/// destination that has failed exactly once, applied in place of the
+	/// quadratic backoff curve so a single transient failure does not hold
+	/// delivery until the next backoff window. A second consecutive failure
+	/// returns to the backoff curve. Set to 0 to disable the grace and back off
+	/// from the first failure.
+	///
+	/// default: 15
+	#[serde(default = "default_sender_retry_grace")]
+	pub sender_retry_grace: u64,
+
 	/// Appservice URL request connection timeout. Defaults to 35 seconds as
 	/// generally appservices are hosted within the same network.
 	///
@@ -659,6 +765,84 @@ pub struct Config {
 	/// default: 300
 	#[serde(default = "default_appservice_idle_timeout")]
 	pub appservice_idle_timeout: u64,
+
+	/// Leave users in an exclusive appservice user namespace (and appservice
+	/// senders) out of push-rule evaluation for room events, as Synapse does.
+	/// They were already skipped because they have no password, but only after
+	/// one database lookup per room member per event.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub appservice_skip_push_targets: bool,
+
+	/// Do not record a private read marker or reset notification counts for
+	/// the sender of each event when the sender is in an exclusive appservice
+	/// user namespace (bridge ghosts and bots): they never read rooms and are
+	/// never push targets, so this bookkeeping is several dead writes per
+	/// bridged event.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub appservice_skip_sender_read_markers: bool,
+
+	/// Do not store the default push-rules account data for users registered
+	/// by an appservice. Readers fall back to the server-default ruleset and
+	/// GET /pushrules recreates the event on demand; storing it costs ~4 KB of
+	/// disk per bridge ghost.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub appservice_skip_default_push_rules: bool,
+
+	/// Do not queue room events for appservice registrations without a URL
+	/// (`url: null` or empty, e.g. double-puppeting registrations). Such
+	/// appservices never receive transactions; the queued events were only
+	/// serialized and then dropped.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub appservice_skip_without_url: bool,
+
+	/// Registration IDs of the appservices that serve the unstable MSC3983
+	/// (one-time key claims) and MSC3984 (device key queries) routes. Key
+	/// claims and key queries for a user in one of these appservices'
+	/// exclusive user namespaces, or for its sender, are forwarded to that
+	/// appservice. No other appservice is asked.
+	///
+	/// The default (empty) forwards nothing. Synapse behaves the same with its
+	/// experimental `msc3983_appservice_otk_claims` and
+	/// `msc3984_appservice_key_query` flags off (their default), and upstream
+	/// Tuwunel removed the forwarding in 1.9.2. List only appservices that
+	/// implement these routes; mautrix bridges do not. Without this gate,
+	/// a /keys/query naming N users of a bridge's namespace sent N requests
+	/// to the bridge, each answered with 404.
+	///
+	/// A 404, 405 or M_UNRECOGNIZED answer from these routes is logged at
+	/// debug level, not as a warning.
+	///
+	/// reloadable: yes
+	/// default: []
+	#[serde(default)]
+	pub appservice_key_proxy: BTreeSet<String>,
+
+	/// Maintain a room's joined/invited/knocked member counters incrementally
+	/// on each membership change (point lookups and +-1) instead of
+	/// recounting every member of the room on every member event. Full
+	/// recounts still happen on joins over federation, state resets and
+	/// migrations.
+	///
+	/// This removes O(members) work per member event (O(N^2) to fill a large
+	/// bridged group), but counters could drift if membership ever changes
+	/// outside the normal update path; disable to return to full recounts.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub incremental_joined_count: bool,
 
 	/// Notification gateway pusher idle connection pool timeout.
 	///
@@ -687,7 +871,7 @@ pub struct Config {
 	/// Grace period for clean shutdown of client requests (seconds).
 	///
 	/// reloadable: yes
-	/// default: 10
+	/// default: 15
 	#[serde(default = "default_client_shutdown_timeout")]
 	pub client_shutdown_timeout: u64,
 
@@ -828,9 +1012,11 @@ pub struct Config {
 	/// display: sensitive
 	pub registration_shared_secret: Option<String>,
 
-	/// Path to a file containing the registration shared secret. Trimmed of
-	/// surrounding whitespace on read. Takes precedence over
-	/// `registration_shared_secret` when both are set.
+	/// Path to a file containing the registration shared secret. Takes
+	/// precedence over `registration_shared_secret`, and falls back to it when
+	/// the file cannot be opened. Surrounding whitespace is trimmed off, so a
+	/// trailing newline does not become part of the secret. A file which is
+	/// present but blank resolves to no secret rather than falling back.
 	///
 	/// reloadable: yes
 	/// example: "/etc/tuwunel/.reg_shared_secret"
@@ -909,6 +1095,70 @@ pub struct Config {
 	/// default: 0
 	#[serde(default)]
 	pub fetch_fanout_rounds: usize,
+
+	/// Derive the state at an incoming federation event from locally held
+	/// events when its previous events are stored but not yet resolved,
+	/// instead of requesting /state_ids from the origin server. Only an event
+	/// whose entire unresolved local ancestry is present participates; any
+	/// other case still falls back to the federation state fetch. Disabling
+	/// this restores the previous behavior of always fetching.
+	///
+	/// reloadable: yes
+	#[serde(default = "true_fn")]
+	pub resolve_state_locally: bool,
+
+	/// Ceiling on how many unresolved local events one local state derivation
+	/// may visit before falling back to the federation state fetch. Bounds
+	/// worst-case memory and latency in rooms with a large unresolved
+	/// backlog. 0 disables local derivation entirely.
+	///
+	/// reloadable: yes
+	/// default: 256
+	#[serde(default = "default_resolve_state_locally_max")]
+	pub resolve_state_locally_max: usize,
+
+	/// Validation mode for local state derivation: compute the local result,
+	/// then fetch /state_ids anyway, compare the two, and log any divergence
+	/// while the fetched state remains authoritative. Federation load is
+	/// unchanged. For operators soaking resolve_state_locally before trusting
+	/// it. No effect unless resolve_state_locally is enabled.
+	///
+	/// reloadable: yes
+	#[serde(default = "true_fn")]
+	pub resolve_state_locally_shadow: bool,
+
+	/// Soft cap on the number of forward extremities tracked per room. When
+	/// applying an incoming federation event would leave the room's frontier
+	/// larger than this, the least useful leaves are pruned from the tracked
+	/// set until it is back at the cap. Pruned events are not deleted and can
+	/// still be referenced by other servers; this server merely stops citing
+	/// them as frontier tips. Events created by this server are never pruned.
+	/// 0 disables automatic pruning.
+	///
+	/// reloadable: yes
+	/// default: 60
+	#[serde(default = "default_forward_extremities_max")]
+	pub forward_extremities_max: usize,
+
+	/// Emergency bound on the per-room frontier. A frontier larger than this
+	/// is cut down to it in a single step, ignoring the per-event pruning
+	/// batch limit. Values at or below forward_extremities_max remove the
+	/// pacing entirely, pruning straight to the cap in one step.
+	///
+	/// reloadable: yes
+	/// default: 256
+	#[serde(default = "default_forward_extremities_emergency_max")]
+	pub forward_extremities_emergency_max: usize,
+
+	/// Upper bound on how many forward extremities one incoming event may
+	/// prune while the frontier is between the cap and the emergency bound.
+	/// Spreads convergence across events to bound the work done by any single
+	/// one. 0 stops paced pruning, leaving only the emergency bound.
+	///
+	/// reloadable: yes
+	/// default: 32
+	#[serde(default = "default_forward_extremities_prune_batch")]
+	pub forward_extremities_prune_batch: usize,
 
 	/// Sets the default `m.federate` property for newly created rooms when the
 	/// client does not request one. If `allow_federation` is set to false at
@@ -1015,15 +1265,11 @@ pub struct Config {
 	#[serde(default)]
 	pub show_all_local_users_in_user_directory: bool,
 
-	/// Allow guests/unauthenticated users to access TURN credentials.
+	/// Allow guest users to access TURN credentials.
 	///
 	/// This is the equivalent of Synapse's `turn_allow_guests` config option.
-	/// This allows any unauthenticated user to call the endpoint
+	/// Setting this to true allows guest users to call the endpoint
 	/// `/_matrix/client/v3/voip/turnServer`.
-	///
-	/// It is unlikely you need to enable this as all major clients support
-	/// authentication for this endpoint and prevents misuse of your TURN server
-	/// from potential bots.
 	/// reloadable: yes
 	#[serde(default)]
 	pub turn_allow_guests: bool,
@@ -1059,22 +1305,6 @@ pub struct Config {
 		alias = "allow_profile_lookup_federation_requests"
 	)]
 	pub allow_inbound_profile_lookup_federation_requests: bool,
-
-	/// Config option to allow or disallow this homeserver from fetching
-	/// remote users' profiles over federation
-	/// (`GET /_matrix/federation/v1/query/profile`) when answering the
-	/// client-server full-profile endpoint
-	/// `GET /_matrix/client/v3/profile/{userId}`.
-	///
-	/// When disabled, that endpoint does not query other servers: it serves a
-	/// locally cached copy if one exists, and otherwise returns
-	/// `403 M_FORBIDDEN` (MSC3550) rather than `404`, so clients can tell a
-	/// withheld profile apart from a missing user. The per-field profile
-	/// endpoints (displayname, avatar_url) are not affected.
-	///
-	/// reloadable: yes
-	#[serde(default = "true_fn")]
-	pub allow_outbound_profile_lookup_federation_requests: bool,
 
 	/// Allow standard users to create rooms. Appservices and admins are always
 	/// allowed to create rooms
@@ -1126,6 +1356,29 @@ pub struct Config {
 	#[serde(default = "default_policy_server_request_timeout")]
 	pub policy_server_request_timeout: u64,
 
+	/// MSC3925: fold the most recent message edit (an `m.replace` relation)
+	/// into `unsigned.m.relations` on a served event as the full replacement
+	/// event, on the client read endpoints. Off by default: it adds a typed
+	/// index seek per served event and a server-authoritative edit summary that
+	/// most clients reconstruct locally anyway, so it is opt-in.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub bundle_edit_relations: bool,
+
+	/// MSC2675/MSC3267: fold reference relations (`m.reference`) into
+	/// `unsigned.m.relations` on a served event as `{ chunk: [{ event_id },
+	/// ...] }`, on the client read endpoints. Off by default: no surveyed
+	/// client renders reference bundles (references are plumbing for polls,
+	/// beacons, and verification, which clients resolve directly), so most
+	/// deployments gain nothing from the added read-time cost.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub bundle_reference_relations: bool,
+
 	/// Default room version tuwunel will create rooms with.
 	///
 	/// The default is prescribed by the spec, but may be selected by developer
@@ -1135,6 +1388,22 @@ pub struct Config {
 	/// reloadable: yes
 	#[serde(default = "default_default_room_version")]
 	pub default_room_version: RoomVersionId,
+
+	/// Default power-level overrides applied when this homeserver creates a new
+	/// room.
+	///
+	/// Uses the same top-level shape as the client `/createRoom`
+	/// `power_level_content_override` parameter and is merged before any
+	/// per-request override, so a client can still override it per room. Only
+	/// affects newly created rooms. Top-level keys replace wholesale rather
+	/// than deep-merging (matching the client parameter): setting `users` or
+	/// `events` replaces the entire computed default submap for that key.
+	///
+	/// reloadable: yes
+	/// default: unset
+	/// config-example: { users_default = 50 }
+	#[serde(default)]
+	pub default_power_level_content_override: Option<serde_json::Value>,
 
 	// external structure; separate section
 	#[serde(default)]
@@ -1277,6 +1546,10 @@ pub struct Config {
 	pub log: String,
 
 	/// Output logs with ANSI colours.
+	///
+	/// Colours are suppressed while entries are submitted to journald, which
+	/// takes the formatted line verbatim and reads control bytes in it as
+	/// binary rather than text.
 	#[serde(default = "true_fn", alias = "log_colours")]
 	pub log_colors: bool,
 
@@ -1311,6 +1584,22 @@ pub struct Config {
 	/// default: false
 	#[serde(default)]
 	pub log_to_stderr: bool,
+
+	/// Submits log output directly to the journald socket instead of the
+	/// console when running under systemd. Each entry carries its actual
+	/// severity as the journal priority, so tools such as `journalctl
+	/// --priority warning` catch Tuwunel's warnings and errors; console output
+	/// is captured by journald at a single fixed priority instead. The message
+	/// is formatted exactly as the console formats it, span fields included,
+	/// while the target, source location and every tracing field are attached
+	/// as journal fields, the latter under an `F_` prefix for queries such as
+	/// `journalctl F_ROOM_ID='!room:example.com'`. This option has no effect
+	/// when not running under systemd, and the console is kept when the
+	/// journald socket cannot be opened.
+	///
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub log_journald: bool,
 
 	/// Setting to false disables the logging/tracing system at a lower level.
 	/// In contrast to configuring an empty `log` string where the system is
@@ -1477,6 +1766,24 @@ pub struct Config {
 	#[serde(default = "true_fn")]
 	pub refresh_token_reuse_revoke: bool,
 
+	/// Enable native registration and login on the built-in OIDC provider
+	/// (next-gen auth), authenticating Matrix clients against this server's own
+	/// accounts without a third-party `identity_provider`.
+	///
+	/// When false (default), the OIDC server runs only to broker for a
+	/// configured `identity_provider`, redirecting users to that upstream IdP.
+	/// When true, an authorization request that selects no provider is served a
+	/// native login or registration page checked against local accounts;
+	/// `well_known.client` must be set. Native and external providers coexist;
+	/// a configured `identity_provider` still brokers as before. Registration
+	/// here honors `allow_registration`, the registration token, and
+	/// `registration_terms` exactly as the client registration endpoint does.
+	///
+	/// reloadable: yes
+	/// default: false
+	#[serde(default)]
+	pub oidc_native_auth: bool,
+
 	/// Require OIDC clients (next-gen auth) to request an MSC2967 device scope.
 	///
 	/// When false, a client that omits the `urn:matrix:client:device:<id>`
@@ -1583,6 +1890,81 @@ pub struct Config {
 	#[serde(default)]
 	pub oidc_rc_burst_count: u32,
 
+	/// Enable the rendezvous session APIs used to sign in with a QR code
+	/// (MSC4108 and MSC4388).
+	///
+	/// The rendezvous session relays the handshake between two devices before
+	/// the OAuth device authorization grant completes the sign-in. This
+	/// requires the built-in OIDC server. When disabled, clients hide the
+	/// feature and the endpoints return an unrecognized response.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub rendezvous_enabled: bool,
+
+	/// Maximum size in bytes of a rendezvous session payload.
+	///
+	/// QR sign-in handshake messages are normally much smaller than the
+	/// default.
+	///
+	/// reloadable: yes
+	/// default: 4096
+	#[serde(default = "default_rendezvous_session_max_bytes")]
+	pub rendezvous_session_max_bytes: usize,
+
+	/// Seconds a rendezvous session lives after its last write.
+	///
+	/// Each update restarts the window, but the device displaying the QR
+	/// times the whole sign-in against the expiry advertised at creation.
+	/// The default leaves time for an interactive account login on the
+	/// approval page.
+	///
+	/// reloadable: yes
+	/// default: 600
+	#[serde(default = "default_rendezvous_session_ttl")]
+	pub rendezvous_session_ttl: u64,
+
+	/// Maximum number of concurrent rendezvous sessions.
+	///
+	/// Creating a session beyond this limit evicts the oldest session instead
+	/// of failing. A value of zero retains one session so creation remains
+	/// available.
+	///
+	/// reloadable: yes
+	/// default: 100
+	#[serde(default = "default_rendezvous_max_sessions")]
+	pub rendezvous_max_sessions: usize,
+
+	/// Require an access token for MSC4388 discovery and session creation.
+	///
+	/// When disabled, clients without an access token may discover and create
+	/// MSC4388 sessions. The MSC4108 endpoint remains open in either mode.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub rendezvous_authenticated_only: bool,
+
+	/// Per-client-IP request refill rate for the MSC4388 rendezvous endpoints.
+	///
+	/// A value of zero is treated as one request per second.
+	///
+	/// reloadable: yes
+	/// default: 10
+	#[serde(default = "default_rendezvous_rc_per_second")]
+	pub rendezvous_rc_per_second: u32,
+
+	/// Token-bucket depth for the MSC4388 rendezvous request throttle.
+	///
+	/// This is the number of requests one client IP may make in a burst before
+	/// `rendezvous_rc_per_second` governs. A value of zero is treated as one.
+	///
+	/// reloadable: yes
+	/// default: 20
+	#[serde(default = "default_rendezvous_rc_burst_count")]
+	pub rendezvous_rc_burst_count: u32,
+
 	/// Static TURN username to provide the client if not using a shared secret
 	/// ("turn_secret"), It is recommended to use a shared secret over static
 	/// credentials.
@@ -1621,14 +2003,18 @@ pub struct Config {
 	/// username/password credentials.
 	///
 	/// display: sensitive
+	/// reloadable: yes
 	#[serde(default)]
 	pub turn_secret: Option<String>,
 
 	/// TURN secret to use that's read from the file path specified.
 	///
-	/// This takes priority over "turn_secret" first, and falls back to
-	/// "turn_secret" if invalid or failed to open.
+	/// This takes priority over "turn_secret", and falls back to it when the
+	/// file cannot be opened. Surrounding whitespace is trimmed off, so a
+	/// trailing newline does not become part of the secret. A file which is
+	/// present but blank resolves to no secret rather than falling back.
 	///
+	/// reloadable: yes
 	/// example: "/etc/tuwunel/.turn_secret"
 	pub turn_secret_file: Option<PathBuf>,
 
@@ -2213,6 +2599,96 @@ pub struct Config {
 	#[serde(default)]
 	pub prune_missing_media: bool,
 
+	/// Largest picture, in pixels, the thumbnailer will decode. Dimensions
+	/// cost memory whatever the encoded file weighs, so a picture declaring
+	/// more than this is left without a thumbnail instead of decoded. A video
+	/// frame inherits the resolution of the video it came from and is bounded
+	/// here too.
+	///
+	/// 50 megapixels is roughly four 8K frames and more than any ordinary
+	/// camera produces. Each pixel is budgeted at four bytes, so the default
+	/// admits a decode of about 200 MiB. The budget is per in-flight request,
+	/// which is what to size it against rather than one decode: thumbnail
+	/// requests are not otherwise limited in number.
+	///
+	/// reloadable: yes
+	/// default: 50000000
+	#[serde(default = "default_media_thumbnail_max_pixels")]
+	pub media_thumbnail_max_pixels: u64,
+
+	/// Program invoked to extract a still frame from a video, giving videos
+	/// uploaded without a thumbnail one anyway. Tuwunel decodes no video
+	/// itself; the frame is scaled and cropped like any other image and the
+	/// result is cached as an ordinary thumbnail.
+	///
+	/// The list is an argument vector whose first entry is the program and
+	/// whose remaining entries are its arguments. It is executed directly,
+	/// never through a shell. Every argument has these tokens substituted
+	/// before each call:
+	///
+	/// - `{input}` path of a temporary file holding the source video.
+	/// - `{width}` and `{height}` the requested thumbnail dimensions.
+	///
+	/// The program writes one frame to standard output in any format the
+	/// thumbnailer decodes: PNG, JPEG, WebP or GIF. Videos are served without
+	/// a thumbnail while the list is empty.
+	///
+	/// reloadable: yes
+	/// example: [
+	/// "ffmpeg", "-loglevel", "error", "-i", "{input}", "-vf", "thumbnail",
+	/// "-frames:v", "1", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1",
+	/// ]
+	///
+	/// default: []
+	#[serde(default)]
+	pub media_video_thumbnail_command: Vec<String>,
+
+	/// Seconds a video thumbnail request may spend on frame extraction. One
+	/// deadline spans the wait for a free slot, staging the video and the
+	/// program itself, so a queue cannot compound it into a multiple. On
+	/// expiry the program and anything it spawned are killed and the video is
+	/// served without a thumbnail.
+	///
+	/// reloadable: yes
+	/// default: 30
+	#[serde(default = "default_media_video_thumbnail_timeout")]
+	pub media_video_thumbnail_timeout: u64,
+
+	/// Video thumbnail extractions permitted to run at once. Decoding video
+	/// costs far more than scaling an image, so requests past this limit wait
+	/// for a slot instead of piling load onto the host. A slot is held from
+	/// staging the video through to the program exiting, so this also bounds
+	/// how many staged videos occupy the staging directory at once. Raise it
+	/// where cores are spare; a restart is required to apply a change.
+	///
+	/// default: 1
+	#[serde(default = "default_media_video_thumbnail_concurrency")]
+	pub media_video_thumbnail_concurrency: usize,
+
+	/// Largest video, in bytes, staged for the thumbnail program, and largest
+	/// frame read back from it. A video past this is served without a
+	/// thumbnail rather than written out, and a frame past it is refused
+	/// rather than decoded from a truncation. Accepts an integer byte count or
+	/// a string with SI/IEC suffix such as "128 MiB".
+	///
+	/// reloadable: yes
+	/// default: 128 MiB
+	#[serde(
+		default = "default_media_video_thumbnail_max_size",
+		deserialize_with = "deserialize_bytesize_usize"
+	)]
+	pub media_video_thumbnail_max_size: usize,
+
+	/// Directory a video is staged in for the thumbnail program to read, one
+	/// file per running program, removed as soon as it exits. Leave unset to
+	/// use a `tmp` subdirectory of the database path, which keeps large videos
+	/// off the memory-backed `/tmp` a service manager commonly provides. Files
+	/// left behind by a killed server are reclaimed at startup.
+	///
+	/// reloadable: yes
+	/// example: "/var/tmp/tuwunel"
+	pub media_video_thumbnail_path: Option<PathBuf>,
+
 	/// List of storage providers to use for media. Providers can be configured
 	/// below in respective sections designated by
 	/// `global.storage_provider.<NAME>.<brand>` where `NAME` can be listed
@@ -2437,6 +2913,20 @@ pub struct Config {
 	)]
 	pub url_preview_max_spider_size: usize,
 
+	/// Maximum size of a single media item fetched or relayed for a URL
+	/// preview: the og:image measurement fetch and the lazy-media relay.
+	/// Media whose advertised length exceeds this is not registered, and a
+	/// relay that would exceed it is refused. Accepts an integer byte count
+	/// or a string with SI/IEC suffix such as "50 MiB".
+	///
+	/// reloadable: yes
+	/// default: 50 MiB
+	#[serde(
+		default = "default_url_preview_max_media_size",
+		deserialize_with = "deserialize_bytesize_usize"
+	)]
+	pub url_preview_max_media_size: usize,
+
 	/// Option to decide whether you would like to run the domain allowlist
 	/// checks (contains and explicit) on the root domain or not. Does not apply
 	/// to URL contains allowlist. Defaults to false.
@@ -2450,6 +2940,24 @@ pub struct Config {
 	/// reloadable: yes
 	#[serde(default)]
 	pub url_preview_check_root_domain: bool,
+
+	/// User-Agent header the URL preview client sends when fetching pages
+	/// to extract their OpenGraph tags. When unset, the versioned server
+	/// User-Agent is used followed by "preview", e.g. "Tuwunel/1.8.1
+	/// preview".
+	///
+	/// default:
+	#[serde(default)]
+	pub url_preview_user_agent: Option<String>,
+
+	/// User-Agent header sent when fetching and relaying URL preview media
+	/// files themselves (og:image, og:video, og:audio, and direct links),
+	/// as opposed to the pages they appear on. When unset, falls back to
+	/// `url_preview_user_agent`, then to the versioned server User-Agent.
+	///
+	/// default:
+	#[serde(default)]
+	pub url_preview_media_user_agent: Option<String>,
 
 	/// List of forbidden room aliases and room IDs as strings of regex
 	/// patterns.
@@ -2576,7 +3084,7 @@ pub struct Config {
 
 	/// Automatically activate the tuwunel admin room console / CLI on
 	/// startup. This option can also be enabled with `--console` tuwunel
-	/// argument.
+	/// argument. Activation requires standard input to be a terminal.
 	#[serde(default)]
 	pub admin_console_automatic: bool,
 
@@ -2758,6 +3266,28 @@ pub struct Config {
 	#[serde(default = "true_fn")]
 	pub admin_room_notices: bool,
 
+	/// Maximum number of message events an admin command's output may be split
+	/// across as replies in the admin room. Output needing more events than
+	/// this is uploaded to the media repository instead and returned as a text
+	/// file attachment replying to the command. When 1, output which fits in a
+	/// single event is posted as a single reply and anything larger becomes an
+	/// attachment. When 0, output is always posted as an attachment regardless
+	/// of size.
+	///
+	/// reloadable: yes
+	/// default: 1
+	#[serde(default = "default_admin_output_max_events")]
+	pub admin_output_max_events: usize,
+
+	/// Post admin command output into a thread on the command event rather than
+	/// as replies. Output split across multiple events per
+	/// `admin_output_max_events` is contained in a single thread; attachment
+	/// outputs are posted into the thread as well.
+	///
+	/// reloadable: yes
+	#[serde(default)]
+	pub admin_output_threads: bool,
+
 	/// Save original events before applying redaction to them.
 	///
 	/// They can be retrieved with `admin debug get-retained-pdu` or MSC2815.
@@ -2794,6 +3324,16 @@ pub struct Config {
 	#[serde(default)]
 	pub disable_local_redactions: bool,
 
+	/// Serve erased senders' events as pruned copies over federation
+	/// (MSC4025). A requesting server retains the unredacted view only when
+	/// one of its users was joined in the room state at the event; join
+	/// handshakes are not gated.
+	///
+	/// reloadable: yes
+	/// default: true
+	#[serde(default = "true_fn")]
+	pub enforce_erasure_over_federation: bool,
+
 	/// Enable database pool affinity support. On supporting systems, block
 	/// device queue topologies are detected and the request pool is optimized
 	/// for the hardware; db_pool_workers is determined automatically.
@@ -2823,7 +3363,7 @@ pub struct Config {
 	/// The value is multiplied by the number of cores which share a device
 	/// queue, since group workers can be scheduled on any of those cores.
 	///
-	/// default: 64
+	/// default: 32
 	#[serde(default = "default_db_pool_workers_limit")]
 	pub db_pool_workers_limit: usize,
 
@@ -3772,11 +4312,13 @@ pub struct IdentityProvider {
 	/// not be reliable.
 	pub icon: Option<OwnedMxcUri>,
 
-	/// Optional list of scopes to authorize. An empty array does not impose any
-	/// restrictions from here, effectively defaulting to all scopes you
-	/// configured for the OAuth application at the provider. This setting
-	/// allows for restricting to a subset of those scopes for this instance.
-	/// Note the user can further restrict scopes during their authorization.
+	/// Optional list of scopes to authorize.
+	///
+	/// An empty array sends `openid email profile`. The exception is
+	/// `brand = "MAS"`, which sends only `openid`: MAS rejects `profile`, and
+	/// its userinfo endpoint returns just `sub` and `username`. Set this to
+	/// request a different subset. The user can further restrict scopes during
+	/// their authorization.
 	///
 	/// default: []
 	#[serde(default)]
@@ -3844,6 +4386,10 @@ pub struct IdentityProvider {
 	/// when the claims fail to match any existing user (in the case of trusted
 	/// providers) or an available username is found (in the case of untrusted
 	/// providers).
+	///
+	/// When LDAP is enabled, a user found in the LDAP directory counts as an
+	/// existing user and is still provisioned on first login, since the
+	/// directory is the authoritative account store.
 	///
 	/// Setting this option to false is generally not useful unless there is
 	/// an explicit reason to do so.
@@ -4188,6 +4734,16 @@ pub struct AppService {
 	/// default: false
 	#[serde(default)]
 	pub device_management: bool,
+
+	/// Whether the application service wants MSC3202 transaction extensions
+	/// (device lists, one-time-key counts, and unused fallback key types).
+	///
+	/// The registration-file key is `org.matrix.msc3202`; this inline-config
+	/// key is `msc3202_transaction_extensions`.
+	///
+	/// default: false
+	#[serde(default)]
+	pub msc3202_transaction_extensions: bool,
 }
 
 impl From<AppService> for ruma::api::appservice::Registration {
@@ -4205,6 +4761,7 @@ impl From<AppService> for ruma::api::appservice::Registration {
 			hs_token: conf.hs_token,
 			receive_ephemeral: conf.receive_ephemeral,
 			device_management: conf.device_management,
+			msc3202_transaction_extensions: conf.msc3202_transaction_extensions,
 			protocols: conf.protocols.into(),
 			rate_limited: conf.rate_limited.into(),
 			sender_localpart,
@@ -4335,6 +4892,16 @@ fn true_fn() -> bool { true }
 
 fn default_policy_server_request_timeout() -> u64 { 5 }
 
+fn default_rendezvous_session_max_bytes() -> usize { 4096 }
+
+fn default_rendezvous_session_ttl() -> u64 { 600 }
+
+fn default_rendezvous_max_sessions() -> usize { 100 }
+
+fn default_rendezvous_rc_per_second() -> u32 { 10 }
+
+fn default_rendezvous_rc_burst_count() -> u32 { 20 }
+
 fn some_true_fn() -> Option<bool> { Some(true) }
 
 #[cfg(test)]
@@ -4361,7 +4928,7 @@ fn default_pdu_cache_capacity() -> u32 { parallelism_scaled_u32(10_000).saturati
 fn default_cache_capacity_modifier() -> f64 { 1.0 }
 
 fn default_auth_chain_cache_capacity() -> u32 {
-	parallelism_scaled_u32(400_000).saturating_add(1_500_000)
+	parallelism_scaled_u32(375_000).saturating_add(1_250_000)
 }
 
 fn default_shorteventid_cache_capacity() -> u32 {
@@ -4418,6 +4985,14 @@ fn default_media_rc_create_per_second() -> u32 { 10 }
 
 fn default_media_rc_create_burst_count() -> u32 { 50 }
 
+fn default_media_thumbnail_max_pixels() -> u64 { 50_000_000 }
+
+fn default_media_video_thumbnail_timeout() -> u64 { 30 }
+
+fn default_media_video_thumbnail_concurrency() -> usize { 1 }
+
+fn default_media_video_thumbnail_max_size() -> usize { 128 * 1024 * 1024 }
+
 fn default_request_conn_timeout() -> u64 { 10 }
 
 fn default_request_timeout() -> u64 { 35 }
@@ -4446,15 +5021,25 @@ fn default_sender_idle_timeout() -> u64 { 180 }
 
 fn default_sender_retry_backoff_limit() -> u64 { 86400 }
 
+fn default_sender_retry_grace() -> u64 { 15 }
+
 fn default_appservice_timeout() -> u64 { 35 }
 
 fn default_appservice_idle_timeout() -> u64 { 300 }
 
 fn default_pusher_idle_timeout() -> u64 { 15 }
 
-fn default_max_fetch_prev_events() -> u16 { 192_u16 }
+fn default_max_fetch_prev_events() -> u16 { 1024_u16 }
 
 fn default_fetch_prev_wait_ms() -> u64 { 750 }
+
+fn default_resolve_state_locally_max() -> usize { 256 }
+
+fn default_forward_extremities_max() -> usize { 60 }
+
+fn default_forward_extremities_emergency_max() -> usize { 256 }
+
+fn default_forward_extremities_prune_batch() -> usize { 32 }
 
 fn default_tracing_flame_filter() -> String {
 	cfg!(debug_assertions)
@@ -4575,6 +5160,10 @@ fn default_url_preview_max_spider_size() -> usize {
 	256_000 // 256KB
 }
 
+fn default_url_preview_max_media_size() -> usize {
+	50 * 1024 * 1024 // 50 MiB
+}
+
 fn default_new_user_displayname_suffix() -> String { "💕".to_owned() }
 
 fn default_sentry_endpoint() -> Option<Url> {
@@ -4600,6 +5189,8 @@ fn default_admin_log_capture() -> String {
 
 fn default_admin_room_tag() -> String { "m.server_notice".to_owned() }
 
+fn default_admin_output_max_events() -> usize { 1 }
+
 #[expect(clippy::as_conversions, clippy::cast_precision_loss)]
 fn parallelism_scaled_f64(val: f64) -> f64 { val * (sys::available_parallelism() as f64) }
 
@@ -4624,7 +5215,7 @@ fn default_db_pool_workers() -> usize {
 		.clamp(32, 1024)
 }
 
-fn default_db_pool_workers_limit() -> usize { 64 }
+fn default_db_pool_workers_limit() -> usize { 32 }
 
 fn default_db_pool_max_workers() -> usize { 2048 }
 

@@ -7,7 +7,7 @@ use ruma::{
 			AccessToken, AccessTokenOptional, AppserviceToken, AppserviceTokenOptional,
 			AuthScheme, NoAccessToken, NoAuthentication,
 		},
-		client::voip::get_turn_server_info,
+		client::rtc::transports,
 		error::{ErrorKind, UnknownTokenErrorData},
 		federation::authentication::ServerSignatures,
 	},
@@ -115,14 +115,18 @@ impl AuthDispatch for AccessToken {
 				_expires_at: user.2,
 				..Auth::default()
 			}),
-			| Token::None
-				if route == TypeId::of::<get_turn_server_info::v3::Request>()
-					&& services.server.config.turn_allow_guests =>
-				Ok(Auth::default()),
+			| Token::None if allows_missing_access_token(route) => Ok(Auth::default()),
 
 			| Token::None => Err!(Request(MissingToken("Missing access token."))),
 		}
 	}
+}
+
+/// MSC4143 transport discovery happens before Element Call attaches Matrix
+/// authentication. The response contains only operator-configured public SFU
+/// metadata, matching the same data exposed through client `.well-known`.
+fn allows_missing_access_token(route: TypeId) -> bool {
+	route == TypeId::of::<transports::v1::Request>()
 }
 
 impl AuthDispatch for AccessTokenOptional {
@@ -242,4 +246,17 @@ async fn expired_token(services: &Services, access_token: &str) -> Result<Auth> 
 		ErrorKind::UnknownToken(UnknownTokenErrorData { soft_logout: true }),
 		"Expired access token.",
 	))
+}
+
+#[cfg(test)]
+mod tests {
+	use ruma::api::client::discovery::get_supported_versions;
+
+	use super::*;
+
+	#[test]
+	fn only_rtc_transport_discovery_bypasses_access_token_auth() {
+		assert!(allows_missing_access_token(TypeId::of::<transports::v1::Request>()));
+		assert!(!allows_missing_access_token(TypeId::of::<get_supported_versions::Request>()));
+	}
 }

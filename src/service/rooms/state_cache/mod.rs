@@ -3,17 +3,21 @@ mod via;
 
 use std::{
 	collections::HashMap,
+	convert::identity,
 	sync::{Arc, RwLock},
 };
 
 use futures::{Stream, StreamExt, future::join5, pin_mut};
 use ruma::{
-	OwnedRoomId, RoomId, ServerName, UserId,
+	OwnedRoomId, OwnedServerName, RoomId, ServerName, UserId,
 	events::{AnyStrippedStateEvent, AnySyncStateEvent, room::member::MembershipState},
 	serde::Raw,
 };
+use serde::de::DeserializeOwned;
 use tuwunel_core::{
-	Result, implement, trace,
+	Result, debug_warn, implement,
+	matrix::{Event, Pdu, event::Owned},
+	trace,
 	utils::{
 		self, BoolExt,
 		future::OptionStream,
@@ -84,14 +88,15 @@ impl crate::Service for Service {
 #[implement(Service)]
 #[tracing::instrument(level = "trace", skip_all)]
 pub async fn appservice_in_room(&self, room_id: &RoomId, appservice: &RegistrationInfo) -> bool {
-	if let Some(cached) = self
+	let cached = self
 		.appservice_in_room_cache
 		.read()
 		.expect("locked")
 		.get(room_id)
 		.and_then(|map| map.get(&appservice.registration.id))
-		.copied()
-	{
+		.copied();
+
+	if let Some(cached) = cached {
 		return cached;
 	}
 
@@ -166,6 +171,39 @@ pub fn server_rooms<'a>(
 		.keys_prefix(&prefix)
 		.ignore_err()
 		.map(|(_, room_id): (Ignore, &RoomId)| room_id)
+}
+
+/// Yields every server participating in at least one known room, each name
+/// once, in ascending order.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "debug")]
+pub fn servers(&self) -> impl Stream<Item = &ServerName> + Send + '_ {
+	self.db
+		.serverroomids
+		.keys()
+		.ignore_err()
+		.ready_scan(
+			None,
+			|last: &mut Option<OwnedServerName>, (server, _): (&ServerName, Ignore)| {
+				let fresh = last.as_deref() != Some(server);
+
+				if fresh {
+					*last = Some(server.to_owned());
+				}
+
+				Some(fresh.then_some(server))
+			},
+		)
+		.ready_filter_map(identity)
+}
+
+/// Returns true if the server participates in at least one room we know of.
+#[implement(Service)]
+#[tracing::instrument(skip(self), level = "trace")]
+pub async fn server_shares_room(&self, server: &ServerName) -> bool {
+	self.server_rooms(server)
+		.ready_any(|_| true)
+		.await
 }
 
 /// Returns true if server can see user by sharing at least one room.
@@ -546,8 +584,11 @@ pub fn rooms_left_state<'a>(
 		.stream_prefix(&prefix)
 		.ignore_err()
 		.map(|((_, room_id), state): KeyVal<'_>| (room_id.to_owned(), state))
-		.map(|(room_id, state)| Ok((room_id, state.deserialize_as_unchecked()?)))
-		.ignore_err()
+		.map(|(room_id, state)| {
+			let state = state_events(&room_id, &state);
+
+			(room_id, state)
+		})
 }
 
 #[implement(Service)]
@@ -599,9 +640,7 @@ pub async fn left_state(
 		.qry(&key)
 		.await
 		.deserialized()
-		.and_then(|val: Raw<Vec<AnyStrippedStateEvent>>| {
-			val.deserialize_as_unchecked().map_err(Into::into)
-		})
+		.map(|state: Raw<Vec<AnyStrippedStateEvent>>| state_events(room_id, &state))
 }
 
 #[implement(Service)]
@@ -761,4 +800,32 @@ pub async fn delete_room_join_counts(&self, room_id: &RoomId, force: bool) -> Re
 		.await;
 
 	Ok(())
+}
+
+/// A sibling conduwuit-lineage server writes the leave event itself into this
+/// column rather than the array of state events written here, and a database
+/// imported from one keeps those rows as it wrote them. Both shapes are read,
+/// neither is rewritten, and the origin writes its own shape again on a swap
+/// back, so this column is not guaranteed to hold one format on disk.
+fn state_events<T, U>(room_id: &RoomId, state: &Raw<T>) -> Vec<U>
+where
+	U: DeserializeOwned + From<Owned<Pdu>>,
+{
+	match state.json().get().trim_start().as_bytes().first() {
+		| Some(b'[') => state
+			.deserialize_as_unchecked()
+			.inspect_err(
+				|e| debug_warn!(%room_id, error = %e, "Unusable cached membership state"),
+			)
+			.unwrap_or_default(),
+
+		// A foreign row holds the leave event alone; lift it into the array shape.
+		| Some(b'{') => state
+			.deserialize_as_unchecked()
+			.map(|event: Pdu| [event.into_format()].into())
+			.inspect_err(|e| debug_warn!(%room_id, error = %e, "Unusable cached leave event"))
+			.unwrap_or_default(),
+
+		| _ => Vec::new(),
+	}
 }

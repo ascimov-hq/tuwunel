@@ -4,8 +4,10 @@ mod preview;
 mod remote;
 mod tests;
 mod thumbnail;
+#[cfg(feature = "media_thumbnail")]
+mod video;
 use std::{
-	collections::HashMap,
+	collections::{HashMap, HashSet},
 	path::PathBuf,
 	sync::{Arc, Mutex},
 	time::{Duration, Instant, SystemTime},
@@ -13,28 +15,33 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose};
-use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt, pin_mut};
+use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt, pin_mut};
 use http::StatusCode;
+use object_store::ObjectMeta;
 use ruma::{
 	Mxc, OwnedMxcUri, OwnedUserId, UserId,
 	api::error::{ErrorKind, RetryAfter},
 	http_headers::ContentDisposition,
 };
+#[cfg(feature = "media_thumbnail")]
+use tokio::sync::Semaphore;
 use tokio::{fs, sync::Notify};
 use tuwunel_core::{
 	Err, Error, Result, debug, debug_error, debug_info, debug_warn, err, trace,
 	utils::{
 		self, BoolExt, MutexMap,
 		result::LogDebugErr,
-		stream::{IterStream, TryReadyExt},
+		stream::{BroadbandExt, IterStream, ReadyExt, TryReadyExt},
 		time::now_millis,
 	},
 	warn,
 };
 use url::Url;
 
-use self::data::{Data, Metadata};
-pub use self::thumbnail::Dim;
+use self::data::Data;
+#[cfg(feature = "media_thumbnail")]
+use self::video::{FAILURES, Failures, sweep_staging_dir};
+pub use self::{data::Metadata, preview::UrlPreviewData, thumbnail::Dim};
 use crate::storage::Provider;
 
 #[derive(Debug)]
@@ -42,6 +49,28 @@ pub struct Media {
 	pub content: Vec<u8>,
 	pub content_type: Option<String>,
 	pub content_disposition: Option<ContentDisposition>,
+}
+
+/// One row of a user's uploaded media, holding only the fields tuwunel can
+/// derive from the uploader index and storage-provider object metadata. The
+/// uploader is carried when the index holds a row for it.
+#[derive(Clone, Debug)]
+pub struct UserMediaEntry {
+	pub mxc: OwnedMxcUri,
+	pub media_type: Option<String>,
+	pub upload_name: Option<String>,
+	pub media_length: Option<u64>,
+	pub created_ts: u64,
+	pub user_id: Option<OwnedUserId>,
+}
+
+/// One locally-uploaded media item's uploader and storage-object byte length
+/// and modification time, the row shape of the media-statistics scan.
+#[derive(Clone, Debug)]
+pub struct UploadStat {
+	pub user_id: OwnedUserId,
+	pub media_length: u64,
+	pub created_ts: u64,
 }
 
 /// For MSC2246
@@ -58,6 +87,10 @@ pub struct Service {
 	url_preview_mutex: MutexMap<String, ()>,
 	federation_mutex: MutexMap<String, ()>,
 	mxc_state: MXCState,
+	#[cfg(feature = "media_thumbnail")]
+	video_thumbnail_slots: Semaphore,
+	#[cfg(feature = "media_thumbnail")]
+	video_thumbnail_failures: Mutex<Failures>,
 }
 
 /// generated MXC ID (`media-id`) length
@@ -75,7 +108,7 @@ const REDIRECT_TTL: Duration = Duration::from_mins(5);
 #[async_trait]
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
-		Ok(Arc::new(Self {
+		let service = Arc::new(Self {
 			db: Data::new(args.db),
 			services: args.services.clone(),
 			url_preview_mutex: MutexMap::new(),
@@ -84,7 +117,21 @@ impl crate::Service for Service {
 				notifiers: Mutex::new(HashMap::new()),
 				ratelimiter: Mutex::new(HashMap::new()),
 			},
-		}))
+			#[cfg(feature = "media_thumbnail")]
+			video_thumbnail_failures: Failures::new(FAILURES).into(),
+			#[cfg(feature = "media_thumbnail")]
+			video_thumbnail_slots: Semaphore::new(
+				args.server
+					.config
+					.media_video_thumbnail_concurrency
+					.max(1),
+			),
+		});
+
+		#[cfg(feature = "media_thumbnail")]
+		sweep_staging_dir(&args.server.config);
+
+		Ok(service)
 	}
 
 	fn name(&self) -> &str { crate::service::make_name(std::module_path!()) }
@@ -186,7 +233,9 @@ impl Service {
 		self.db.remove_pending_mxc(mxc);
 
 		let mxc_uri: OwnedMxcUri = mxc.to_string().into();
-		if let Some(notifier) = self.mxc_state.notifiers.lock()?.remove(&mxc_uri) {
+		let notifier = self.mxc_state.notifiers.lock()?.remove(&mxc_uri);
+
+		if let Some(notifier) = notifier {
 			notifier.notify_waiters();
 		}
 
@@ -218,6 +267,15 @@ impl Service {
 	/// Deletes a file in the database and from the media directory via an MXC
 	#[tracing::instrument(level = "trace", skip(self))]
 	pub async fn delete(&self, mxc: &Mxc<'_>) -> Result {
+		// lazy URL-preview media has no file keys of its own; drop its reference
+		// and staged bytes whenever present so a delete can't re-mint the media
+		let had_lazy = self.db.search_lazy_media(mxc).await.is_ok();
+		if had_lazy {
+			let key = mxc.to_string();
+			self.db.remove_lazy_media(&key);
+			self.db.remove_lazy_content(&key);
+		}
+
 		match self.db.search_mxc_metadata_prefix(mxc).await {
 			| Ok(keys) => {
 				for key in keys {
@@ -234,11 +292,10 @@ impl Service {
 
 				Ok(())
 			},
-			| _ => {
-				Err!(Database(error!(
-					"Failed to find any media keys for MXC {mxc} in our database."
-				)))
-			},
+			| _ if had_lazy => Ok(()),
+			| _ => Err!(Database(error!(
+				"Failed to find any media keys for MXC {mxc} in our database."
+			))),
 		}
 	}
 
@@ -359,7 +416,7 @@ impl Service {
 			.await;
 
 		let Ok(Metadata { content_type, content_disposition, key }) = meta else {
-			return Err!(Request(NotFound("Media not found.")));
+			return self.fetch_lazy_media(mxc).await;
 		};
 
 		let path = self.get_media_name_sha256(&key);
@@ -384,6 +441,66 @@ impl Service {
 			content_type,
 			content_disposition,
 		})
+	}
+
+	/// Resolve lazy URL-preview media on first download, promoting the staged
+	/// or freshly-fetched bytes into the media store so the origin is fetched
+	/// at most once per item.
+	#[tracing::instrument(level = "debug", skip(self))]
+	async fn fetch_lazy_media(&self, mxc: &Mxc<'_>) -> Result<Media> {
+		let key = mxc.to_string();
+
+		// bound outbound amplification to one in-flight fetch per mxc; requests
+		// for the same mxc queue rather than fan out
+		let _lock = self.federation_mutex.lock(&key).await;
+
+		// a queued waiter for the same mxc may have promoted it already
+		if self
+			.db
+			.search_file_metadata(mxc, &Dim::default())
+			.await
+			.is_ok()
+		{
+			// box the cold re-entry to break the get_stored/fetch_lazy_media cycle
+			return Box::pin(self.get_stored(mxc)).await;
+		}
+
+		let media = match self.db.get_lazy_content(&key).await {
+			| Ok(media) => media,
+			| Err(_) => {
+				let Ok(url) = self.db.search_lazy_media(mxc).await else {
+					return Err!(Request(NotFound("Media not found.")));
+				};
+
+				let limit = self.services.config.url_preview_max_media_size;
+				self.location_request(&self.services.client.url_preview_media, &url, limit)
+					.await?
+			},
+		};
+
+		// promote through the ordinary upload path so real file metadata makes
+		// every later download and thumbnail a normal-media hit
+		if let Err(e) = self
+			.create(
+				mxc,
+				None,
+				media.content_disposition.as_ref(),
+				media.content_type.as_deref(),
+				&media.content,
+			)
+			.await
+		{
+			// a failed promotion leaves metadata without bytes, masking the lazy
+			// fallback on every later read; drop it so the next read retries
+			self.db.delete_file_mxc(mxc).await;
+
+			return Err(e);
+		}
+
+		self.db.remove_lazy_media(&key);
+		self.db.remove_lazy_content(&key);
+
+		Ok(media)
 	}
 
 	/// Presigned redirect URL for locally-stored media (MSC3860).
@@ -459,6 +576,165 @@ impl Service {
 		}
 
 		Ok(mxcs)
+	}
+
+	/// Every media item uploaded by a local user, carrying the fields tuwunel
+	/// can derive: content type, upload name, byte length and modification time
+	/// from storage-provider object metadata. Untracked columns (last-access,
+	/// quarantine, url-cache) are not represented.
+	#[tracing::instrument(level = "debug", skip(self))]
+	pub async fn user_media(&self, user: &UserId) -> Result<Vec<UserMediaEntry>> {
+		let entries = self
+			.db
+			.get_all_user_mxcs(user)
+			.await
+			.into_iter()
+			.stream()
+			.broad_filter_map(async |mxc| self.user_media_entry(Some(user), mxc).await)
+			.collect()
+			.await;
+
+		Ok(entries)
+	}
+
+	/// Derivable metadata for the single media item at the given MXC, with the
+	/// uploading local user resolved from the uploader index when present.
+	#[tracing::instrument(level = "debug", skip(self))]
+	pub async fn media_entry(&self, mxc: &Mxc<'_>) -> Option<UserMediaEntry> {
+		let user = self.db.mxc_user(mxc).await;
+
+		self.user_media_entry(user.as_deref(), mxc.to_string().into())
+			.await
+	}
+
+	async fn user_media_entry(
+		&self,
+		user: Option<&UserId>,
+		mxc: OwnedMxcUri,
+	) -> Option<UserMediaEntry> {
+		let parts = mxc.parts().ok()?;
+		let Metadata { content_type, content_disposition, key } =
+			self.get_metadata(&parts).await?;
+
+		let object = self.head_meta(&key).await;
+		let upload_name = content_disposition.and_then(|disposition| disposition.filename);
+
+		Some(UserMediaEntry {
+			media_type: content_type,
+			upload_name,
+			media_length: object.as_ref().map(|object| object.size),
+			created_ts: object.as_ref().map(mtime_millis).unwrap_or(0),
+			user_id: user.map(ToOwned::to_owned),
+			mxc,
+		})
+	}
+
+	/// Uploader, byte length and storage modification time of every media item
+	/// uploaded by a local user, one row per upload; media missing from every
+	/// storage provider are skipped.
+	pub fn upload_stats(&self) -> impl Stream<Item = UploadStat> + Send + '_ {
+		self.db
+			.all_uploads()
+			.broad_filter_map(async |(mxc, user_id)| {
+				let parts = mxc.parts().ok()?;
+				let Metadata { key, .. } = self.get_metadata(&parts).await?;
+				let object = self.head_meta(&key).await?;
+
+				Some(UploadStat {
+					user_id,
+					media_length: object.size,
+					created_ts: mtime_millis(&object),
+				})
+			})
+	}
+
+	/// Deletes local media older than `before_ts` (by storage-provider mtime)
+	/// and strictly larger than `size_gt` bytes, sparing profile and
+	/// room-avatar media when `keep_profiles`. Returns the deleted MXCs, empty
+	/// when none match. Quarantine and protection flags are not tracked, so no
+	/// media is spared on those grounds.
+	#[tracing::instrument(level = "debug", skip(self))]
+	pub async fn delete_by_date_size(
+		&self,
+		before_ts: u64,
+		size_gt: u64,
+		keep_profiles: bool,
+	) -> Result<Vec<OwnedMxcUri>> {
+		let spared = keep_profiles
+			.then_async(|| self.avatar_mxcs())
+			.await
+			.unwrap_or_default();
+
+		let candidates = self.get_all_mxcs().await?;
+
+		let deleted: Vec<OwnedMxcUri> = candidates
+			.into_iter()
+			.stream()
+			.ready_filter(|mxc| self.is_local(mxc) && !spared.contains(mxc))
+			.broad_filter_map(async |mxc| {
+				let parts = mxc.parts().ok()?;
+				let Metadata { key, .. } = self.get_metadata(&parts).await?;
+				let object = self.head_meta(&key).await?;
+
+				let eligible = mtime_millis(&object) < before_ts && object.size > size_gt;
+
+				eligible
+					.then_async(|| self.delete(&parts))
+					.await
+					.and_then(Result::ok)
+					.map(|()| mxc)
+			})
+			.collect()
+			.await;
+
+		Ok(deleted)
+	}
+
+	/// The MXCs of every local user's profile avatar and every room's avatar,
+	/// the spare-set honoured by `keep_profiles`.
+	async fn avatar_mxcs(&self) -> HashSet<OwnedMxcUri> {
+		let user_avatars = self
+			.services
+			.users
+			.list_local_users()
+			.map(ToOwned::to_owned)
+			.broad_filter_map(async |user| self.services.profile.avatar_url(&user).await.ok());
+
+		let room_avatars = self
+			.services
+			.metadata
+			.iter_ids()
+			.map(ToOwned::to_owned)
+			.broad_filter_map(async |room_id| {
+				self.services
+					.state_accessor
+					.get_avatar(&room_id)
+					.await
+					.ok()
+					.and_then(|avatar| avatar.url)
+			});
+
+		user_avatars.chain(room_avatars).collect().await
+	}
+
+	fn is_local(&self, mxc: &OwnedMxcUri) -> bool {
+		mxc.server_name()
+			.is_ok_and(|server| self.services.globals.server_is_ours(server))
+	}
+
+	/// First storage provider's object metadata for the media stored under
+	/// `key` (byte length and modification time), or `None` when no provider
+	/// holds it.
+	async fn head_meta(&self, key: &[u8]) -> Option<ObjectMeta> {
+		let path = self.get_media_name_sha256(key);
+
+		let stream = self
+			.storage_providers()
+			.stream()
+			.filter_map(async |provider| provider.head(&path).await.log_debug_err().ok());
+
+		pin_mut!(stream);
+		stream.next().await
 	}
 
 	/// Deletes all media files before or after the given time. Returns a usize
@@ -551,10 +827,6 @@ impl Service {
 			}
 		}
 
-		if remote_mxcs.is_empty() {
-			return Err!(Database("Did not found any eligible MXCs to delete."));
-		}
-
 		debug_info!("Deleting media now in the past {time:?}");
 
 		let mut deletion_count: usize = 0;
@@ -573,7 +845,6 @@ impl Service {
 				},
 				| Err(e) => {
 					warn!("Failed to delete {mxc}, ignoring error and skipping: {e}");
-					continue;
 				},
 			}
 		}
@@ -675,9 +946,8 @@ impl Service {
 	#[inline]
 	#[must_use]
 	pub fn get_media_path_sha256(&self, key: &[u8]) -> PathBuf {
-		let mut r = self.get_media_dir();
-		r.push(self.get_media_name_sha256(key));
-		r
+		self.get_media_dir()
+			.join(self.get_media_name_sha256(key))
 	}
 
 	/// new SHA256 file name media function. requires database migrated. uses
@@ -697,21 +967,23 @@ impl Service {
 	/// base64 key as the filename.
 	#[must_use]
 	pub fn get_media_path_b64(&self, key: &[u8]) -> PathBuf {
-		let mut r = self.get_media_dir();
-		let encoded = encode_key(key);
-		r.push(encoded);
-		r
+		self.get_media_dir().join(encode_key(key))
 	}
 
 	#[must_use]
 	pub fn get_media_dir(&self) -> PathBuf {
-		let mut r = PathBuf::new();
-		r.push(self.services.server.config.database_path.clone());
-		r.push("media");
-		r
+		self.services
+			.server
+			.config
+			.database_path
+			.join("media")
 	}
 }
 
 #[inline]
 #[must_use]
 pub fn encode_key(key: &[u8]) -> String { general_purpose::URL_SAFE_NO_PAD.encode(key) }
+
+fn mtime_millis(object: &ObjectMeta) -> u64 {
+	u64::try_from(object.last_modified.timestamp_millis()).unwrap_or(0)
+}

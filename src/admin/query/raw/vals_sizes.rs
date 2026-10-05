@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use futures::StreamExt;
-use tokio::time::Instant;
 use tuwunel_core::{
 	Result, at,
 	utils::{
@@ -10,15 +9,16 @@ use tuwunel_core::{
 	},
 };
 
-use super::with_map_or;
+use super::{decode, with_map_or};
 use crate::admin_command;
 
 #[admin_command]
 pub(super) async fn raw_vals_sizes(&self, map: Option<String>, prefix: Option<String>) -> Result {
-	let prefix = prefix.as_deref().unwrap_or(EMPTY);
+	let prefix = decode(prefix.as_deref().unwrap_or(EMPTY));
 
-	let timer = Instant::now();
-	let result = with_map_or(map.as_deref(), self.services)?
+	let maps = with_map_or(map.as_deref(), self.services)?;
+
+	let query = maps
 		.iter()
 		.stream()
 		.map(|map| map.raw_stream_prefix(&prefix))
@@ -30,9 +30,7 @@ pub(super) async fn raw_vals_sizes(&self, map: Option<String>, prefix: Option<St
 			let entry = map.entry(len).or_default();
 			*entry = entry.saturating_add(1);
 			map
-		})
-		.await;
+		});
 
-	let query_time = timer.elapsed();
-	write!(self, "```\n{result:#?}\n```\n\nQuery completed in {query_time:?}").await
+	self.write_timed_query(query).await
 }

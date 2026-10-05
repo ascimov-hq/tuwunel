@@ -4,10 +4,12 @@ use std::{
 };
 
 use axum::{Router, extract::connect_info::IntoMakeServiceWithConnectInfo};
-use axum_server::Handle;
-use axum_server_dual_protocol::{ServerExt, axum_server::tls_rustls::RustlsConfig};
+use axum_server::{Handle, from_tcp_rustls};
+use axum_server_dual_protocol::{
+	ServerExt, axum_server::tls_rustls::RustlsConfig, from_tcp_dual_protocol,
+};
 use futures::{FutureExt, future::BoxFuture};
-use tuwunel_core::{Result, debug, err, info, itertools::Itertools};
+use tuwunel_core::{Result, debug, err, info};
 
 pub(super) async fn serve<'a>(
 	app: &Router,
@@ -16,7 +18,6 @@ pub(super) async fn serve<'a>(
 	key: &Path,
 	dual_protocol: bool,
 	listeners: impl Iterator<Item = TcpListener>,
-	addrs: &[SocketAddr],
 ) -> Result<Vec<BoxFuture<'a, Result<(), std::io::Error>>>> {
 	info!(
 		"Note: It is strongly recommended that you use a reverse proxy instead of running \
@@ -36,9 +37,9 @@ pub(super) async fn serve<'a>(
 		.into_make_service_with_connect_info::<SocketAddr>();
 
 	if dual_protocol {
-		serve_dual_protocol(&app, &conf, handle, listeners, addrs)
+		serve_dual_protocol(&app, &conf, handle, listeners)
 	} else {
-		serve_tls(&app, &conf, handle, listeners, addrs)
+		serve_tls(&app, &conf, handle, listeners)
 	}
 }
 
@@ -47,27 +48,18 @@ fn serve_dual_protocol<'a>(
 	conf: &RustlsConfig,
 	handle: &Handle<SocketAddr>,
 	listeners: impl Iterator<Item = TcpListener>,
-	addrs: &[SocketAddr],
 ) -> Result<Vec<BoxFuture<'a, Result<(), std::io::Error>>>> {
-	let bound_servers = addrs.iter().map(|addr| -> Result<_> {
-		Ok(axum_server_dual_protocol::bind_dual_protocol(*addr, conf.clone()))
-	});
-
-	let passed_servers = listeners.map(|listener| -> Result<_> {
-		Ok(axum_server_dual_protocol::from_tcp_dual_protocol(
-			listener.try_clone()?,
-			conf.clone(),
-		)?
-		.set_upgrade(false))
-	});
-
-	bound_servers
-		.chain(passed_servers)
-		.map_ok(|server| {
-			server
+	listeners
+		.map(|listener| {
+			// Pinned against an upstream default flip: a plain request is answered,
+			// never redirected to the https scheme.
+			let acceptor = from_tcp_dual_protocol(listener, conf.clone())?
+				.set_upgrade(false)
 				.handle(handle.clone())
 				.serve(app.clone())
-				.boxed()
+				.boxed();
+
+			Ok(acceptor)
 		})
 		.collect()
 }
@@ -77,23 +69,15 @@ fn serve_tls<'a>(
 	conf: &RustlsConfig,
 	handle: &Handle<SocketAddr>,
 	listeners: impl Iterator<Item = TcpListener>,
-	addrs: &[SocketAddr],
 ) -> Result<Vec<BoxFuture<'a, Result<(), std::io::Error>>>> {
-	let bound_servers = addrs
-		.iter()
-		.map(|addr| -> Result<_> { Ok(axum_server::bind_rustls(*addr, conf.clone())) });
-
-	let passed_servers = listeners.map(|listener| -> Result<_> {
-		Ok(axum_server::from_tcp_rustls(listener.try_clone()?, conf.clone())?)
-	});
-
-	bound_servers
-		.chain(passed_servers)
-		.map_ok(|server| {
-			server
+	listeners
+		.map(|listener| {
+			let acceptor = from_tcp_rustls(listener, conf.clone())?
 				.handle(handle.clone())
 				.serve(app.clone())
-				.boxed()
+				.boxed();
+
+			Ok(acceptor)
 		})
 		.collect()
 }

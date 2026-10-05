@@ -51,6 +51,10 @@ dockerTools.buildImage {
   name = "complement-tuwunel";
   tag = "main";
 
+  # The appservice_dir configured in config.toml must exist for the server
+  # to start; Complement only copies registration files into it.
+  extraCommands = "mkdir -p complement/appservice";
+
   copyToRoot = buildEnv {
     name = "root";
     pathsToLink = [

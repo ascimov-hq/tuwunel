@@ -14,17 +14,16 @@ use axum::{
 	extract::{Form, Request, State},
 	response::{Html, IntoResponse, Redirect, Response},
 };
-use futures::StreamExt;
 use http::{
 	HeaderValue, Method, StatusCode,
-	header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, REFERRER_POLICY},
+	header::{CACHE_CONTROL, CONTENT_TYPE, REFERRER_POLICY},
 };
-use ruma::{OwnedDeviceId, OwnedRoomId};
+use ruma::OwnedDeviceId;
 use tuwunel_core::{
 	Err, Error, Result, err,
 	utils::{BoolExt, html::escape as html_escape},
 };
-use tuwunel_service::{Services, users::propagation_default};
+use tuwunel_service::Services;
 use url::Url;
 
 use self::{
@@ -37,7 +36,10 @@ use self::{
 	session_list::sessions_list_html,
 	session_view::session_view_html,
 };
-use super::url_encode;
+use super::{
+	authorize::should_serve_native, consume_login_token, peek_login_token, sso_redirect_url,
+	url_encode,
+};
 
 pub(crate) static ACCOUNT_MANAGEMENT_ACTIONS_SUPPORTED: &[&str] = &[
 	"org.matrix.profile",
@@ -58,7 +60,7 @@ static ACCOUNT_JS: &str = include_str!("account/account.js");
 /// Shared stylesheet served at `/_tuwunel/oidc/account.css`.
 static ACCOUNT_CSS: &str = include_str!("account/account.css");
 
-static ACCOUNT_HEAD: &str = r#"
+pub(super) static ACCOUNT_HEAD: &str = r#"
 	<meta charset="UTF-8">
 	<link rel="stylesheet" href="/_tuwunel/oidc/account.css">
 "#;
@@ -69,20 +71,6 @@ static ACCOUNT_JS_INCLUDE: &str = r#"
 
 /// Cache-control header value.
 static ACCOUNT_CACHE_CONTROL: &str = "no-store";
-
-/// CSP for account-management HTML pages. The global CSP has `form-action
-/// 'none'` and `sandbox` (which both block form submission).
-/// `SetResponseHeaderLayer::if_not_present` means our header takes precedence.
-/// Styles are served from `/_tuwunel/oidc/account.css` so `style-src 'self'`
-/// suffices.
-static ACCOUNT_CSP: &[&str] = &[
-	"default-src 'none';",
-	"script-src 'self';",
-	"style-src 'self';",
-	"form-action 'self';",
-	"frame-ancestors 'none';",
-	"base-uri 'none';",
-];
 
 #[derive(Debug, Default, serde::Deserialize)]
 struct AccountQueryParams {
@@ -116,10 +104,65 @@ pub(crate) async fn get_account_route(
 
 	let device_id = params.device_id.as_deref().unwrap_or_default();
 
-	match account_sso_redirect(&services, action, device_id) {
-		| Ok(redirect) => account_redirect_response(redirect),
+	match account_auth_redirect(&services, action, device_id) {
+		| Ok(response) => response,
 		| Err(e) => account_error_response(&e),
 	}
+}
+
+fn account_auth_redirect(services: &Services, action: &str, device_id: &str) -> Result<Response> {
+	validate_account_action(action)?;
+
+	let idp_id = services.oauth.providers.get_default_id();
+	let wants_create = false;
+	let serve_native =
+		should_serve_native(services.config.oidc_native_auth, idp_id.is_some(), wants_create);
+
+	match serve_native {
+		| true => account_native_redirect(services, action, device_id),
+		| false => account_sso_redirect(services, action, device_id, idp_id.as_deref()),
+	}
+}
+
+fn account_native_redirect(
+	services: &Services,
+	action: &str,
+	device_id: &str,
+) -> Result<Response> {
+	let issuer = services.oauth.get_server()?.issuer_url()?;
+	let base = issuer.trim_end_matches('/');
+
+	let native_url = Url::parse_with_params(&format!("{base}/_tuwunel/oidc/native"), [
+		("action", action),
+		("device_id", device_id),
+	])
+	.map_err(|_| err!(Request(InvalidParam("Failed to build native login URL"))))?;
+
+	Ok(account_redirect_response(Redirect::temporary(native_url.as_str())))
+}
+
+fn account_sso_redirect(
+	services: &Services,
+	action: &str,
+	device_id: &str,
+	idp_id: Option<&str>,
+) -> Result<Response> {
+	let idp_id = idp_id
+		.ok_or_else(|| err!(Config("identity_provider", "No identity provider configured")))?;
+
+	let issuer = services.oauth.get_server()?.issuer_url()?;
+	let base = issuer.trim_end_matches('/');
+
+	let callback_url =
+		Url::parse_with_params(&format!("{base}/_tuwunel/oidc/account_callback"), [
+			("action", action),
+			("device_id", device_id),
+		])
+		.map_err(|_| err!(error!("Failed to build account callback URL")))?;
+
+	let sso_url = sso_redirect_url(base, idp_id, &callback_url)?;
+
+	Ok(account_redirect_response(Redirect::temporary(sso_url.as_str())))
 }
 
 pub(crate) async fn get_account_callback_route(
@@ -183,7 +226,22 @@ async fn handle_account_callback(
 
 	// Validations before consuming the token so that an invalid action does not
 	// burn the user's single-use login_token needlessly.
-	account_management_idp_id(services)?;
+	services.oauth.get_server()?;
+
+	(services.config.oidc_native_auth
+		|| services
+			.oauth
+			.providers
+			.get_default_id()
+			.is_some())
+	.then_some(())
+	.ok_or_else(|| {
+		err!(Config(
+			"identity_provider",
+			"No identity provider or native authentication configured"
+		))
+	})?;
+
 	validate_account_action(action)?;
 
 	// MSC4191 stable action names dispatch through the prototype aliases.
@@ -232,27 +290,10 @@ async fn handle_account_callback(
 				.is_false()
 				.then_some(cleaned_dn.as_str());
 
-			let all_joined_rooms: Vec<OwnedRoomId> = services
-				.state_cache
-				.rooms_joined(&user_id)
-				.map(ToOwned::to_owned)
-				.collect()
-				.await;
-
 			services
-				.users
-				.update_displayname(
-					&user_id,
-					displayname,
-					&all_joined_rooms,
-					propagation_default(
-						services
-							.server
-							.config
-							.preserve_room_profile_overrides,
-					),
-				)
-				.await;
+				.profile
+				.set_displayname(&user_id, displayname, None)
+				.await?;
 
 			profile_saved_html(&user_id, displayname).await
 		},
@@ -313,35 +354,7 @@ async fn handle_account_callback(
 	}
 }
 
-fn account_sso_redirect(services: &Services, action: &str, device_id: &str) -> Result<Redirect> {
-	validate_account_action(action)?;
-
-	let default_idp = account_management_idp_id(services)?;
-	let idp_id_enc = url_encode(&default_idp);
-
-	let issuer = services.oauth.get_server()?.issuer_url()?;
-	let base = issuer.trim_end_matches('/');
-
-	let mut callback_url = Url::parse(&format!("{base}/_tuwunel/oidc/account_callback"))
-		.map_err(|_| err!(error!("Failed to build account callback URL")))?;
-
-	callback_url
-		.query_pairs_mut()
-		.append_pair("action", action)
-		.append_pair("device_id", device_id);
-
-	let mut sso_url =
-		Url::parse(&format!("{base}/_matrix/client/v3/login/sso/redirect/{idp_id_enc}"))
-			.map_err(|_| err!(error!("Failed to build SSO URL")))?;
-
-	sso_url
-		.query_pairs_mut()
-		.append_pair("redirectUrl", callback_url.as_str());
-
-	Ok(Redirect::temporary(sso_url.as_str()))
-}
-
-fn account_redirect_response(redirect: Redirect) -> Response {
+pub(super) fn account_redirect_response(redirect: Redirect) -> Response {
 	let mut response = redirect.into_response();
 
 	response
@@ -357,18 +370,13 @@ fn account_redirect_response(redirect: Redirect) -> Response {
 
 // Prevent the login token in the callback URL from leaking via the Referer
 // header to any embedded resources.
-fn account_html_response(status: StatusCode, html: String) -> Response {
-	let csp = ACCOUNT_CSP.join("");
-	let headers = [
-		(CACHE_CONTROL, ACCOUNT_CACHE_CONTROL),
-		(CONTENT_SECURITY_POLICY, csp.as_str()),
-		(REFERRER_POLICY, "no-referrer"),
-	];
+pub(super) fn account_html_response(status: StatusCode, html: String) -> Response {
+	let headers = [(CACHE_CONTROL, ACCOUNT_CACHE_CONTROL), (REFERRER_POLICY, "no-referrer")];
 
 	(status, headers, Html(html)).into_response()
 }
 
-fn account_error_response(error: &Error) -> Response {
+pub(super) fn account_error_response(error: &Error) -> Response {
 	let msg = error.sanitized_message();
 	let code = error.status_code();
 
@@ -396,41 +404,6 @@ fn account_error_page(message: &str) -> String {
 			</body>
 		</html>"#
 	)
-}
-
-/// Consume a login token (single-use authentication).
-async fn consume_login_token(
-	services: &Services,
-	token: Option<&str>,
-) -> Result<ruma::OwnedUserId> {
-	let token = token.ok_or(err!(Request(Forbidden("Missing login token"))))?;
-
-	services
-		.users
-		.find_from_login_token(token)
-		.await
-		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
-}
-
-/// Verify a login token without consuming it. Used by GET handlers that embed
-/// the token in a POST confirmation form. The token is consumed later when the
-/// form is submitted.
-async fn peek_login_token(services: &Services, token: Option<&str>) -> Result<ruma::OwnedUserId> {
-	let token = token.ok_or(err!(Request(Forbidden("Missing login token"))))?;
-
-	services
-		.users
-		.peek_login_token(token)
-		.await
-		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
-}
-
-fn account_management_idp_id(services: &Services) -> Result<String> {
-	services
-		.oauth
-		.providers
-		.get_default_id()
-		.ok_or_else(|| err!(Config("identity_provider", "No identity provider configured")))
 }
 
 fn validate_account_action(action: &str) -> Result {

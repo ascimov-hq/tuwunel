@@ -85,6 +85,17 @@ reliability at a slight performance cost due to TCP overhead.
 
 ## RocksDB / database issues
 
+#### Disk fills up but the database does not appear to grow
+
+On btrfs, `du` can report a database of a few hundred megabytes while `df`
+shows tens of gigabytes consumed and still climbing. RocksDB preallocates its
+write-ahead logs with `fallocate(2)`, and Copy-on-Write keeps the whole
+preallocated extent pinned after the log is truncated on close, so the space a
+file occupies bears no relation to its length.
+Set `rocksdb_allow_fallocate = false`; see
+[the btrfs section of maintenance](maintenance.md#btrfs) for how to confirm the
+diagnosis and reclaim the space.
+
 #### Database corruption
 
 There are many causes and varieties of database corruption. There are several

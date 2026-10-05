@@ -3,11 +3,12 @@ use std::{any::TypeId, fmt::Debug, mem, ops::Deref};
 use axum::{body::Body, extract::FromRequest};
 use axum_extra::extract::cookie::CookieJar;
 use bytes::{BufMut, Bytes, BytesMut};
+use http::Method;
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, DeviceId, OwnedDeviceId, OwnedServerName,
 	OwnedUserId, ServerName, UserId, api::IncomingRequest,
 };
-use tuwunel_core::{Error, Result, debug_warn, err, trace, utils::string::EMPTY};
+use tuwunel_core::{Err, Error, Result, err, trace, utils::string::EMPTY};
 use tuwunel_service::{Services, appservice::RegistrationInfo};
 
 use super::{
@@ -102,19 +103,23 @@ where
 		let mut json_body = serde_json::from_slice::<CanonicalJsonValue>(&request.body).ok();
 		trace!(?request);
 
-		// while very unusual and really shouldn't be recommended, Synapse accepts POST
-		// requests with a completely empty body. very old clients, libraries, and some
-		// appservices still call APIs like /join like this. so let's just default to
-		// empty object `{}` to copy synapse's behaviour
-		if json_body.is_none()
-			&& request.parts.method == http::Method::POST
-			&& !request.parts.uri.path().contains("/media/")
-		{
-			debug_warn!(
-				"received a POST request with an empty body, defaulting/assuming to {{}} like \
-				 Synapse does"
-			);
-			json_body = Some(CanonicalJsonValue::Object(CanonicalJsonObject::new()));
+		// An empty body defaults to `{}` like Synapse so a UIA flow can start;
+		// a present body that is not valid JSON is rejected as M_NOT_JSON.
+		let json_endpoint = matches!(
+			request.parts.method,
+			Method::POST | Method::PUT | Method::DELETE | Method::PATCH
+		) && !request.parts.uri.path().contains("/media/");
+
+		if json_body.is_none() && json_endpoint {
+			let empty = request.body.iter().all(u8::is_ascii_whitespace);
+
+			if !empty && serde_json::from_slice::<serde_json::Value>(&request.body).is_err() {
+				return Err!(Request(NotJson("Request body is not valid JSON.")));
+			}
+
+			if empty && matches!(request.parts.method, Method::POST | Method::DELETE) {
+				json_body = Some(CanonicalJsonValue::Object(CanonicalJsonObject::new()));
+			}
 		}
 
 		let auth = auth::auth::<T::Authentication>(

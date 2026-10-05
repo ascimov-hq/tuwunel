@@ -5,16 +5,17 @@ use std::{borrow::Cow, collections::BTreeMap, net::IpAddr, time::Duration};
 use axum::extract::State;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as b64};
-use futures::{FutureExt, StreamExt, TryFutureExt, future::try_join};
+use futures::{FutureExt, TryFutureExt, future::try_join};
 use reqwest::header::{CONTENT_TYPE, HeaderValue};
 use ruma::{
-	Mxc, OwnedMxcUri, OwnedRoomId, OwnedUserId, ServerName, UserId,
+	Mxc, OwnedMxcUri, OwnedUserId, ServerName, UserId,
 	api::client::{
 		session::{SsoRedirectAction, sso_callback, sso_login, sso_login_with_provider},
 		uiaa::AuthType,
 	},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use tuwunel_core::{
 	Err, Result, at,
 	config::IdentityProvider,
@@ -40,11 +41,11 @@ use tuwunel_service::{
 		CODE_VERIFIER_LENGTH, Provider, SESSION_ID_LENGTH, Session, TokenResponse, UserInfo,
 		unique_id_sub,
 	},
-	users::{PASSWORD_SENTINEL, Register, propagation_default},
+	users::{PASSWORD_SENTINEL, Register},
 };
 use url::Url;
 
-pub(crate) use self::uiaa::sso_fallback_route;
+pub(crate) use self::uiaa::{sso_complete_js_route, sso_css_route, sso_fallback_route};
 use super::TOKEN_LENGTH;
 use crate::{ClientIp, Ruma};
 
@@ -73,6 +74,72 @@ struct GrantCookie<'a> {
 }
 
 static GRANT_SESSION_COOKIE: &str = "tuwunel_grant_session";
+
+/// Path attribute for the grant-session cookie. The set and removal cookies
+/// must use the same value: a cookie is only replaced (and thus removed) when
+/// its name, domain and path all match (RFC 6265 5.3), and a Set-Cookie
+/// without an explicit path defaults to the request-URI's directory.
+fn grant_session_cookie_path(callback_url: Option<&Url>) -> &str {
+	callback_url.map(Url::path).unwrap_or("/")
+}
+
+fn decode_apple_userinfo_from_id_token(session: &Session) -> Result<UserInfo> {
+	let id_token = session.id_token.as_deref().ok_or_else(|| {
+		err!(Request(Unauthorized("Missing Apple id_token in token response.")))
+	})?;
+
+	let payload_b64 = id_token
+		.split('.')
+		.nth(1)
+		.ok_or_else(|| err!(Request(Unauthorized("Apple id_token is malformed."))))?;
+
+	let payload = b64
+		.decode(payload_b64)
+		.map_err(|_| err!(Request(Unauthorized("Apple id_token payload is invalid base64."))))?;
+
+	let payload: JsonValue = serde_json::from_slice(&payload)
+		.map_err(|_| err!(Request(Unauthorized("Apple id_token payload is not valid JSON."))))?;
+
+	let sub = payload
+		.get("sub")
+		.and_then(JsonValue::as_str)
+		.ok_or_else(|| {
+			err!(Request(Unauthorized("Apple id_token missing required sub claim.")))
+		})?;
+
+	let email = payload
+		.get("email")
+		.and_then(JsonValue::as_str)
+		.map(ToOwned::to_owned);
+
+	let preferred_username = email
+		.as_deref()
+		.and_then(|value| value.split_once('@'))
+		.map(at!(0))
+		.map(ToOwned::to_owned);
+
+	Ok(UserInfo {
+		sub: sub.to_owned(),
+		preferred_username: preferred_username.clone(),
+		username: preferred_username,
+		nickname: None,
+		name: payload
+			.get("name")
+			.and_then(JsonValue::as_str)
+			.map(ToOwned::to_owned),
+		given_name: payload
+			.get("given_name")
+			.and_then(JsonValue::as_str)
+			.map(ToOwned::to_owned),
+		family_name: payload
+			.get("family_name")
+			.and_then(JsonValue::as_str)
+			.map(ToOwned::to_owned),
+		email,
+		avatar_url: None,
+		picture: None,
+	})
+}
 
 /// # `GET /_matrix/client/v3/login/sso/redirect`
 ///
@@ -219,11 +286,7 @@ async fn handle_sso_login(
 		redirect_uri: redirect_url.as_str().into(),
 	};
 
-	let cookie_path = provider
-		.callback_url
-		.as_ref()
-		.map(Url::path)
-		.unwrap_or("/");
+	let cookie_path = grant_session_cookie_path(provider.callback_url.as_ref());
 
 	let cookie_max_age = provider
 		.grant_session_duration
@@ -344,7 +407,27 @@ pub(crate) async fn sso_callback_route(
 	let userinfo = services
 		.oauth
 		.request_userinfo((&provider, &session))
-		.await?;
+		.await
+		.or_else(|error| {
+			if provider.brand != "appleoidc" {
+				return Err(error);
+			}
+
+			debug_warn!(
+				?error,
+				idp_id = provider.id(),
+				"Failed to fetch Apple userinfo endpoint; falling back to id_token claims.",
+			);
+
+			decode_apple_userinfo_from_id_token(&session).map_err(|decode_error| {
+				debug_warn!(
+					?decode_error,
+					idp_id = provider.id(),
+					"Failed to decode Apple id_token fallback.",
+				);
+				error
+			})
+		})?;
 
 	let unique_id = unique_id_sub((&provider, &userinfo.sub))?;
 
@@ -366,11 +449,15 @@ pub(crate) async fn sso_callback_route(
 	};
 
 	if !services.users.exists(&user_id).await {
-		if !provider.registration {
-			return Err!(Request(Forbidden("Registration from this provider is disabled")));
-		}
+		let origin = match provider.registration {
+			| true => "sso",
+			// Present in LDAP is an existing user to provision, not a new registration.
+			| false if ldap_user_exists(&services, &user_id).await => "ldap",
+			| false =>
+				return Err!(Request(Forbidden("Registration from this provider is disabled"))),
+		};
 
-		register_user(&services, &provider, &session, &userinfo, &user_id).await?;
+		register_user(&services, &provider, &session, &userinfo, &user_id, origin).await?;
 	}
 
 	services.oauth.sessions.put(&session).await;
@@ -387,6 +474,7 @@ pub(crate) async fn sso_callback_route(
 	}
 
 	let cookie = Cookie::build((GRANT_SESSION_COOKIE, EMPTY))
+		.path(grant_session_cookie_path(provider.callback_url.as_ref()))
 		.removal()
 		.build()
 		.to_string()
@@ -453,6 +541,7 @@ fn apply_token_response(session: Session, token: TokenResponse) -> Result<Sessio
 		scope: token.scope,
 		token_type: token.token_type,
 		access_token: token.access_token,
+		id_token: token.id_token,
 		expires_at,
 		refresh_token: token.refresh_token,
 		refresh_token_expires_at,
@@ -583,6 +672,17 @@ async fn handle_uiaa(
 	Ok(sso_callback::unstable::Response { location, cookie: Some(cookie) })
 }
 
+async fn ldap_user_exists(services: &Services, user_id: &UserId) -> bool {
+	cfg!(feature = "ldap")
+		&& services.config.ldap.enable
+		&& services
+			.users
+			.search_ldap(user_id)
+			.await
+			.log_err()
+			.is_ok_and(|dns| !dns.is_empty())
+}
+
 #[tracing::instrument(
 	name = "register",
 	level = INFO_SPAN_LEVEL,
@@ -595,6 +695,7 @@ async fn register_user(
 	session: &Session,
 	userinfo: &UserInfo,
 	user_id: &UserId,
+	origin: &str,
 ) -> Result {
 	debug_info!(%user_id, "Creating new user account...");
 
@@ -603,7 +704,7 @@ async fn register_user(
 		.full_register(Register {
 			user_id: Some(user_id),
 			password: Some(PASSWORD_SENTINEL),
-			origin: Some("sso"),
+			origin: Some(origin),
 			displayname: userinfo.name.as_deref(),
 			grant_first_user_admin: true,
 			..Default::default()
@@ -631,9 +732,7 @@ async fn register_user(
 		format!("New user \"{user_id}\" registered on this server via {idp_name} ({idp_id})");
 
 	info!("{notice}");
-	if services.server.config.admin_room_notices {
-		services.admin.notice(&notice).await;
-	}
+	services.admin.notify(&notice).await;
 
 	Ok(())
 }
@@ -677,29 +776,11 @@ async fn set_avatar(
 		.create(&mxc, Some(user_id), Some(&content_disposition), content_type.as_deref(), &bytes)
 		.await?;
 
-	let all_joined_rooms: Vec<OwnedRoomId> = services
-		.state_cache
-		.rooms_joined(user_id)
-		.map(ToOwned::to_owned)
-		.collect()
-		.await;
-
 	let mxc_uri: OwnedMxcUri = mxc.to_string().into();
 	services
-		.users
-		.update_avatar_url(
-			user_id,
-			Some(&mxc_uri),
-			None,
-			&all_joined_rooms,
-			propagation_default(
-				services
-					.server
-					.config
-					.preserve_room_profile_overrides,
-			),
-		)
-		.await;
+		.profile
+		.set_avatar_url(user_id, Some(&mxc_uri), None)
+		.await?;
 
 	Ok(())
 }
@@ -855,5 +936,120 @@ fn parse_user_id(server_name: &ServerName, username: &str) -> Result<OwnedUserId
 				"Username {username} contains disallowed characters or spaces: {e}"
 			)))),
 		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use serde_json::json;
+
+	use super::*;
+
+	fn apple_session_with_claims(claims: &serde_json::Value) -> Session {
+		let payload = b64.encode(serde_json::to_vec(claims).expect("serialize claims"));
+
+		Session {
+			id_token: Some(format!("header.{payload}.signature")),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn decode_apple_userinfo_from_id_token_extracts_expected_claims() {
+		let session = apple_session_with_claims(&json!({
+			"sub": "apple-user-123",
+			"email": "alice@example.com",
+			"name": "Alice Example",
+			"given_name": "Alice",
+			"family_name": "Example"
+		}));
+
+		let userinfo =
+			decode_apple_userinfo_from_id_token(&session).expect("decode Apple id_token claims");
+
+		assert_eq!(userinfo.sub, "apple-user-123");
+		assert_eq!(userinfo.email.as_deref(), Some("alice@example.com"));
+		assert_eq!(userinfo.preferred_username.as_deref(), Some("alice"));
+		assert_eq!(userinfo.username.as_deref(), Some("alice"));
+		assert_eq!(userinfo.name.as_deref(), Some("Alice Example"));
+		assert_eq!(userinfo.given_name.as_deref(), Some("Alice"));
+		assert_eq!(userinfo.family_name.as_deref(), Some("Example"));
+	}
+
+	#[test]
+	fn decode_apple_userinfo_from_id_token_requires_sub_claim() {
+		let session = apple_session_with_claims(&json!({
+			"email": "alice@example.com"
+		}));
+
+		let error = decode_apple_userinfo_from_id_token(&session)
+			.expect_err("missing sub claim should fail");
+
+		let message = format!("{error}");
+		assert!(message.contains("sub claim"), "unexpected error: {message}");
+	}
+
+	#[test]
+	fn decode_apple_userinfo_from_id_token_requires_id_token() {
+		let session = Session::default();
+
+		let error = decode_apple_userinfo_from_id_token(&session)
+			.expect_err("missing id_token should fail");
+
+		let message = format!("{error}");
+		assert!(message.contains("Missing Apple id_token"), "unexpected error: {message}");
+	}
+
+	#[test]
+	fn decode_apple_userinfo_from_id_token_rejects_invalid_payload() {
+		let session = Session {
+			id_token: Some("header.!.signature".to_owned()),
+			..Default::default()
+		};
+
+		let error = decode_apple_userinfo_from_id_token(&session)
+			.expect_err("invalid id_token payload should fail");
+
+		let message = format!("{error}");
+		assert!(message.contains("invalid base64"), "unexpected error: {message}");
+	}
+
+	#[test]
+	fn grant_session_cookie_path_uses_the_callback_path() {
+		let callback = Url::parse(
+			"https://matrix.example/_matrix/client/unstable/login/sso/callback/tuwunel_abc",
+		)
+		.expect("valid URL");
+
+		assert_eq!(
+			grant_session_cookie_path(Some(&callback)),
+			"/_matrix/client/unstable/login/sso/callback/tuwunel_abc"
+		);
+		assert_eq!(grant_session_cookie_path(None), "/");
+	}
+
+	#[test]
+	fn grant_session_removal_cookie_path_matches_the_set_cookie_path() {
+		let callback = Url::parse(
+			"https://matrix.example/_matrix/client/unstable/login/sso/callback/tuwunel_abc",
+		)
+		.expect("valid URL");
+
+		let set = Cookie::build((GRANT_SESSION_COOKIE, "grant"))
+			.path(grant_session_cookie_path(Some(&callback)))
+			.build();
+
+		let removal = Cookie::build((GRANT_SESSION_COOKIE, EMPTY))
+			.path(grant_session_cookie_path(Some(&callback)))
+			.removal()
+			.build();
+
+		assert_eq!(set.path(), removal.path());
+		assert!(
+			removal
+				.to_string()
+				.contains("Path=/_matrix/client/unstable/login/sso/callback/tuwunel_abc"),
+			"unexpected removal cookie: {removal}"
+		);
 	}
 }

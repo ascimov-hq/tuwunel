@@ -12,6 +12,7 @@ mod cf_opts;
 pub(crate) mod context;
 mod db_opts;
 pub(crate) mod descriptor;
+mod env;
 mod events;
 mod files;
 mod logger;
@@ -22,24 +23,27 @@ mod repair;
 mod tests;
 
 use std::{
+	collections::BTreeMap,
 	ffi::CStr,
 	sync::{
-		Arc,
+		Arc, OnceLock, Weak,
 		atomic::{AtomicU32, Ordering},
 	},
 };
 
 use rocksdb::{
 	AsColumnFamilyRef, BoundColumnFamily, DBCommon, DBWithThreadMode, MultiThreaded,
-	WaitForCompactOptions,
+	WaitForCompactOptions, WriteOptions,
 };
-use tuwunel_core::{Err, Result, debug, info, warn};
+use tuwunel_core::{Err, Result, debug, implement, info, warn};
 
 use crate::{
-	Context,
+	Context, Map,
 	pool::Pool,
 	util::{map_err, result},
 };
+
+pub(crate) type CfIndex = BTreeMap<u32, Weak<Map>>;
 
 /// Handle to the opened RocksDB database and its shared resources.
 ///
@@ -64,6 +68,13 @@ pub struct Engine {
 
 	/// Verify block checksums on read.
 	pub(crate) checksums: bool,
+
+	/// Shared write options for atomic batch commits.
+	pub(crate) write_options: WriteOptions,
+
+	/// Resolves catalog column ids for post-commit watcher notification.
+	/// Runtime migration column families are intentionally absent.
+	cf_index: OnceLock<CfIndex>,
 
 	/// Live cork count; nonzero suppresses the per-write WAL flush.
 	corks: AtomicU32,
@@ -93,10 +104,11 @@ impl Engine {
 		self.db.wait_for_compact(&opts).map_err(map_err)
 	}
 
-	/// Flush the memtables to SST files.
+	/// Flush the memtables to SST files (a RocksDB LSM-tree flush).
 	///
-	/// Forces buffered writes out of memory into the on-disk LSM tree; distinct
-	/// from `flush` and `sync`, which act on the write-ahead log.
+	/// Forces buffered writes out of memory into the on-disk LSM tree. An LSM
+	/// flush, not a libc `fflush(3)` or `fsync(2)`, and distinct from the
+	/// `flush` and `sync` methods here, which act on the write-ahead log.
 	#[tracing::instrument(
 		level = "info",
 		skip_all,
@@ -218,6 +230,23 @@ impl Engine {
 	#[inline]
 	#[must_use]
 	pub fn is_secondary(&self) -> bool { self.secondary }
+}
+
+#[implement(Engine)]
+pub(crate) fn set_cf_index(&self, index: CfIndex) {
+	self.cf_index
+		.set(index)
+		.expect("cf_index initialized twice");
+}
+
+#[implement(Engine)]
+#[inline]
+pub(crate) fn map_by_cf_id(&self, cf_id: u32) -> Option<Arc<Map>> {
+	self.cf_index
+		.get()
+		.expect("cf_index initialized before writes")
+		.get(&cf_id)
+		.and_then(Weak::upgrade)
 }
 
 impl Drop for Engine {

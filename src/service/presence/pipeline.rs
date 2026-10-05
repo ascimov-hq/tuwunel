@@ -4,7 +4,7 @@
 //! aggregation and timer logic in one place so the public `Service` surface
 //! remains small and the update flow is easy to review.
 
-use std::{net::IpAddr, time::Duration};
+use std::time::Duration;
 
 use futures::TryFutureExt;
 use ruma::{
@@ -12,14 +12,16 @@ use ruma::{
 };
 use tokio::time::sleep;
 use tuwunel_core::{
-	Error, Result, debug, error,
+	Error, Result, debug,
+	debug::INFO_SPAN_LEVEL,
+	error,
 	result::LogErr,
 	trace,
 	utils::{future::OptionFutureExt, option::OptionExt},
 };
 
 use super::{
-	Service, TimerFired,
+	Ping, Service, TimerFired,
 	aggregate::{self, StatusMsg},
 };
 
@@ -89,6 +91,17 @@ impl Service {
 		expected_count != current_count
 	}
 
+	#[tracing::instrument(
+		name = "presence",
+		level = INFO_SPAN_LEVEL,
+		skip_all,
+		fields(
+			%user_id,
+			?device_key,
+			%state,
+			?currently_active,
+		),
+	)]
 	#[expect(clippy::too_many_arguments)]
 	async fn apply_device_presence_update(
 		&self,
@@ -102,6 +115,7 @@ impl Service {
 	) -> Result {
 		let now = tuwunel_core::utils::millis_since_unix_epoch();
 		let preserve_status = matches!(status_msg, StatusMsg::Unchanged);
+
 		// 1) Capture per-device presence snapshot for aggregation.
 		debug!(
 			?user_id,
@@ -111,6 +125,7 @@ impl Service {
 			last_active_ago = last_active_ago.map(u64::from),
 			"Presence update received"
 		);
+
 		self.device_presence
 			.update(
 				user_id,
@@ -128,6 +143,7 @@ impl Service {
 			.device_presence
 			.aggregate(user_id, now, self.idle_timeout, self.offline_timeout)
 			.await;
+
 		debug!(
 			?user_id,
 			agg_state = ?aggregated.state,
@@ -166,12 +182,14 @@ impl Service {
 			self.schedule_presence_timer(user_id, presence, count)
 				.log_err()
 				.ok();
+
 			debug!(
 				?user_id,
 				?state,
 				last_last_active_ago,
 				"Skipping presence update: refresh window (timer rescheduled)"
 			);
+
 			return Ok(());
 		}
 
@@ -185,6 +203,7 @@ impl Service {
 				to = ?aggregated.state,
 				"Presence went inactive; flushing suppressed pushes"
 			);
+
 			self.services
 				.sending
 				.schedule_flush_suppressed_for_user(
@@ -217,31 +236,33 @@ impl Service {
 		.await
 	}
 
-	/// Pings the presence of the given user, setting the specified state. When
-	/// device_id is supplied.
-	pub async fn maybe_ping_presence(
-		&self,
-		user_id: &UserId,
-		device_id: Option<&DeviceId>,
-		client_ip: Option<IpAddr>,
-		new_state: &PresenceState,
-	) -> Result {
+	/// Pings the presence of the given user, defaulting the state to online.
+	///
+	/// Requests authenticated with an appservice token do not imply user
+	/// activity. In particular, they must not update presence or device
+	/// last-seen data. Explicit appservice presence updates use
+	/// [`Self::set_presence_for_device`] instead.
+	pub async fn maybe_ping_presence(&self, user_id: &UserId, args: Ping<'_>) -> Result {
 		const REFRESH_TIMEOUT: u64 = 30 * 1000;
 
-		if !self.services.server.config.allow_local_presence || self.services.db.is_read_only() {
+		if args.appservice.is_some()
+			|| !self.services.server.config.allow_local_presence
+			|| self.services.db.is_read_only()
+		{
 			return Ok(());
 		}
 
-		let update_device_seen = device_id.map_async(|device_id| {
+		let update_device_seen = args.device_id.map_async(|device_id| {
 			self.services
 				.users
-				.update_device_last_seen(user_id, device_id, client_ip, None)
+				.update_device_last_seen(user_id, device_id, args.client_ip, None)
 		});
 
+		let new_state = args.new_state.unwrap_or(&PresenceState::Online);
 		let currently_active = *new_state == PresenceState::Online;
 		let set_presence = self.apply_device_presence_update(
 			user_id,
-			Self::device_key(device_id, false),
+			Self::device_key(args.device_id, false),
 			new_state,
 			Some(currently_active),
 			UInt::new(0),
@@ -344,7 +365,7 @@ impl Service {
 			return Ok(());
 		}
 
-		let presence_state = presence.state().clone();
+		let presence_state = presence.state.clone();
 		let now = tuwunel_core::utils::millis_since_unix_epoch();
 		let aggregated = self
 			.device_presence
@@ -353,8 +374,8 @@ impl Service {
 
 		if aggregated.device_count == 0 {
 			let last_active_ago =
-				Some(UInt::new_saturating(now.saturating_sub(presence.last_active_ts())));
-			let status_msg = presence.status_msg();
+				Some(UInt::new_saturating(now.saturating_sub(presence.last_active_ts)));
+			let status_msg = presence.status_msg;
 
 			let new_state = match (&presence_state, last_active_ago.map(u64::from)) {
 				| (PresenceState::Online, Some(ago)) if ago >= self.idle_timeout =>
@@ -398,9 +419,7 @@ impl Service {
 				.schedule_flush_suppressed_for_user(user_id.to_owned(), "presence->inactive");
 		}
 
-		let status_msg = aggregated
-			.status_msg
-			.or_else(|| presence.status_msg());
+		let status_msg = aggregated.status_msg.or(presence.status_msg);
 		let last_active_ago =
 			Some(UInt::new_saturating(now.saturating_sub(aggregated.last_active_ts)));
 
@@ -429,7 +448,7 @@ pub(super) async fn presence_timer(
 
 #[cfg(test)]
 mod tests {
-	use ruma::{presence::PresenceState, uint, user_id};
+	use ruma::{uint, user_id};
 
 	use super::*;
 

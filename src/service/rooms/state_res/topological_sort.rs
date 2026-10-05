@@ -162,7 +162,7 @@ where
 	Query: Fn(OwnedEventId) -> Fut + Sync,
 	Fut: Future<Output = Result<TieBreaker>> + Send,
 {
-	try_unfold((heap, graph), move |(mut heap, graph)| async move {
+	try_unfold((heap, graph), async move |(mut heap, graph)| {
 		let Some(Reverse(item)) = heap.pop() else {
 			return Ok(None);
 		};
@@ -173,7 +173,7 @@ where
 			.into_iter()
 			.flatten()
 			.try_stream()
-			.try_fold(state, |(event_id, (mut heap, mut graph)), parent_id| async move {
+			.try_fold(state, async |(event_id, (mut heap, mut graph)), parent_id| {
 				graph
 					.get_mut(&parent_id)
 					.expect("contains all parent_ids")
@@ -227,16 +227,18 @@ where
 		.is_some()
 }
 
-/// Whether `items` are already in reverse topological order, reading each
-/// item's references in place instead of from a prebuilt graph. An item must
-/// follow every item it references that is also present among `items`; a
-/// reference to an absent item is a non-edge. `id` reads an item's identifier,
-/// `references` its outgoing references.
+/// Checks reverse topological reference order without building a graph.
 ///
-/// This allocates nothing, scanning the remaining items for each reference
-/// rather than building a seen-set. The scan is quadratic, so it suits short
-/// sequences; [`is_topologically_sorted`] is the better pick for a large
-/// sequence or one whose graph is already built.
+/// Every referenced identifier that occurs in `items` must precede the item
+/// that references it; absent references are ignored. `id` extracts an item's
+/// identifier and `references` yields its outgoing references. The check does
+/// not apply [`topological_sort`]'s tie-breaker or reject unrelated duplicate
+/// identifiers.
+///
+/// This allocates nothing. Each yielded reference scans the remaining suffix,
+/// requiring at most `n * R` identifier comparisons for `n` items and `R`
+/// references. Prefer [`is_topologically_sorted`] for a large sequence or when
+/// its graph is already available.
 pub fn is_topologically_sorted_in_place<'a, T, Id, Refs, Ref>(
 	items: &'a [T],
 	id: Id,

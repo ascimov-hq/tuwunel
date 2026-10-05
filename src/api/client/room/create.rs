@@ -33,7 +33,7 @@ use ruma::{
 	serde::{JsonObject, Raw},
 };
 use serde::Deserialize;
-use serde_json::{json, value::to_raw_value};
+use serde_json::{Value as JsonValue, json, value::to_raw_value};
 use tuwunel_core::{
 	Err, Result, debug_info, debug_warn, err, info,
 	matrix::{
@@ -183,16 +183,20 @@ async fn apply_creator_join_pdu(
 	room_id: &RoomId,
 	state_lock: &RoomMutexGuard,
 ) -> Result {
+	let mut content = RoomMemberEventContent {
+		is_direct: body.is_direct,
+		..RoomMemberEventContent::new(MembershipState::Join)
+	};
+
+	services
+		.profile
+		.fill_profile_data(sender_user, &mut content)
+		.await;
+
 	services
 		.timeline
 		.build_and_append_pdu(
-			PduBuilder::state(sender_user.to_string(), &RoomMemberEventContent {
-				displayname: services.users.displayname(sender_user).await.ok(),
-				avatar_url: services.users.avatar_url(sender_user).await.ok(),
-				blurhash: services.users.blurhash(sender_user).await.ok(),
-				is_direct: Some(body.is_direct),
-				..RoomMemberEventContent::new(MembershipState::Join)
-			}),
+			PduBuilder::state(sender_user.to_string(), &content),
 			sender_user,
 			room_id,
 			state_lock,
@@ -213,8 +217,14 @@ async fn apply_power_levels_pdu(
 	let users =
 		build_power_levels_users(services, body, preset, version_rules, sender_user).await;
 
+	let default_override = services
+		.config
+		.default_power_level_content_override
+		.as_ref();
+
 	let power_levels_content = default_power_levels_content(
 		version_rules,
+		default_override,
 		body.power_level_content_override.as_ref(),
 		preset,
 		users,
@@ -487,7 +497,7 @@ async fn process_invites(
 		.iter()
 		.stream()
 		.filter(|&user_id| invite_allowed(services, sender_user, user_id))
-		.for_each(|user_id| async {
+		.for_each(async |user_id| {
 			if let Err(e) = services
 				.membership
 				.invite(sender_user, user_id, room_id, None, body.is_direct)
@@ -526,14 +536,13 @@ async fn finalize_alias_and_directory(
 	}
 
 	if body.visibility == room::Visibility::Public {
-		services.directory.set_public(room_id);
+		services.directory.set_public(room_id, alias);
 
-		if services.server.config.admin_room_notices {
-			services
-				.admin
-				.send_text(&format!("{sender_user} made {room_id} public to the room directory"))
-				.await;
-		}
+		services
+			.admin
+			.notify_loud(&format!("{sender_user} made {room_id} public to the room directory"))
+			.await;
+
 		info!("{sender_user} made {0} public to the room directory", room_id);
 	}
 
@@ -647,7 +656,7 @@ async fn create_create_event_legacy(
 	services: &Services,
 	body: &Ruma<create_room::v3::Request>,
 	room_version: &RoomVersionId,
-	_version_rules: &RoomVersionRules,
+	version_rules: &RoomVersionRules,
 ) -> Result<(OwnedRoomId, RoomMutexGuard)> {
 	let room_id: OwnedRoomId = match &body.room_id {
 		| None => RoomId::new_v1(&services.server.name),
@@ -663,8 +672,6 @@ async fn create_create_event_legacy(
 
 	let create_content = match &body.creation_content {
 		| Some(content) => {
-			use RoomVersionId::*;
-
 			let mut content = content
 				.deserialize_as_unchecked::<CanonicalJsonObject>()
 				.map_err(|e| {
@@ -673,22 +680,15 @@ async fn create_create_event_legacy(
 					))))
 				})?;
 
-			match room_version {
-				| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 => {
-					content.insert(
-						"creator".into(),
-						json!(body.sender_user())
-							.try_into()
-							.map_err(|e| {
-								err!(Request(BadJson(debug_error!(
-									"Invalid creation content: {e}"
-								))))
-							})?,
-					);
-				},
-				| _ => {
-					// V11+ removed the "creator" key
-				},
+			if !version_rules.authorization.use_room_create_sender {
+				content.insert(
+					"creator".into(),
+					json!(body.sender_user())
+						.try_into()
+						.map_err(|e| {
+							err!(Request(BadJson(debug_error!("Invalid creation content: {e}"))))
+						})?,
+				);
 			}
 
 			if !services.config.federate_created_rooms
@@ -707,12 +707,10 @@ async fn create_create_event_legacy(
 			content
 		},
 		| None => {
-			use RoomVersionId::*;
-
-			let content = match room_version {
-				| V1 | V2 | V3 | V4 | V5 | V6 | V7 | V8 | V9 | V10 =>
-					RoomCreateEventContent::new_v1(body.sender_user().to_owned()),
-				| _ => RoomCreateEventContent::new_v11(),
+			let content = if !version_rules.authorization.use_room_create_sender {
+				RoomCreateEventContent::new_v1(body.sender_user().to_owned())
+			} else {
+				RoomCreateEventContent::new_v11()
 			};
 
 			let mut content =
@@ -750,10 +748,11 @@ async fn create_create_event_legacy(
 /// creates the power_levels_content for the PDU builder
 fn default_power_levels_content(
 	version_rules: &RoomVersionRules,
+	default_power_level_content_override: Option<&JsonValue>,
 	power_level_content_override: Option<&Raw<RoomPowerLevelsContentOverride>>,
 	preset: &RoomPreset,
 	users: BTreeMap<OwnedUserId, Int>,
-) -> Result<serde_json::Value> {
+) -> Result<JsonValue> {
 	use serde_json::to_value;
 
 	let mut power_levels_content = RoomPowerLevelsEventContent::new(&version_rules.authorization);
@@ -793,16 +792,37 @@ fn default_power_levels_content(
 		power_levels_content["events"]["org.matrix.msc3401.call.member"] = json!(50);
 	}
 
-	if let Some(power_level_content_override) = power_level_content_override {
-		let json: JsonObject = serde_json::from_str(power_level_content_override.json().get())
-			.map_err(|e| err!(Request(BadJson("Invalid power_level_content_override: {e:?}"))))?;
+	if let Some(default_power_level_content_override) = default_power_level_content_override {
+		let overrides = default_power_level_content_override
+			.as_object()
+			.expect("default_power_level_content_override is validated at startup")
+			.iter()
+			.map(|(key, value)| (key.clone(), value.clone()));
 
-		for (key, value) in json {
-			power_levels_content[key] = value;
-		}
+		merge_power_level_content_override(&mut power_levels_content, overrides);
+	}
+
+	if let Some(power_level_content_override) = power_level_content_override {
+		let overrides: JsonObject =
+			serde_json::from_str(power_level_content_override.json().get()).map_err(|e| {
+				err!(Request(BadJson("Invalid power_level_content_override: {e:?}")))
+			})?;
+
+		merge_power_level_content_override(&mut power_levels_content, overrides);
 	}
 
 	Ok(power_levels_content)
+}
+
+/// Replace each top-level power-levels key wholesale; no deep merge.
+fn merge_power_level_content_override(
+	power_levels_content: &mut JsonValue,
+	overrides: impl IntoIterator<Item = (String, JsonValue)>,
+) {
+	power_levels_content
+		.as_object_mut()
+		.expect("power levels content must serialize to an object")
+		.extend(overrides);
 }
 
 /// if a room is being created with a room alias, run our checks
@@ -937,9 +957,7 @@ async fn can_publish_directory_check(
 	);
 
 	warn!("{msg}");
-	if services.server.config.admin_room_notices {
-		services.admin.notice(&msg).await;
-	}
+	services.admin.notify(&msg).await;
 
 	Err!(Request(Forbidden("Publishing rooms to the room directory is not allowed")))
 }
@@ -993,4 +1011,64 @@ fn take_initial(
 	initial_state
 		.extract_if(.., |event| &event.event_type == event_type && event.state_key == state_key)
 		.next()
+}
+
+#[cfg(test)]
+mod tests {
+	use tuwunel_core::matrix::room_version::rules;
+
+	use super::*;
+
+	#[test]
+	fn default_power_levels_content_applies_server_default_override() {
+		let version_rules = rules(&RoomVersionId::V11).expect("supported room version");
+
+		let content = default_power_levels_content(
+			&version_rules,
+			Some(&json!({ "users_default": 50 })),
+			None,
+			&RoomPreset::PrivateChat,
+			BTreeMap::new(),
+		)
+		.expect("power levels content");
+
+		assert_eq!(content["users_default"], json!(50));
+	}
+
+	#[test]
+	fn request_override_wins_over_server_default_override() {
+		let version_rules = rules(&RoomVersionId::V11).expect("supported room version");
+		let request_override =
+			Raw::from_json(to_raw_value(&json!({ "users_default": 75 })).expect("raw json"));
+
+		let content = default_power_levels_content(
+			&version_rules,
+			Some(&json!({ "users_default": 50 })),
+			Some(&request_override),
+			&RoomPreset::PrivateChat,
+			BTreeMap::new(),
+		)
+		.expect("power levels content");
+
+		assert_eq!(content["users_default"], json!(75));
+	}
+
+	#[test]
+	fn default_override_preserves_explicit_user_power_levels() {
+		let version_rules = rules(&RoomVersionId::V11).expect("supported room version");
+		let creator = OwnedUserId::try_from("@alice:example.com").expect("valid user id");
+		let users = BTreeMap::from([(creator.clone(), int!(100))]);
+
+		let content = default_power_levels_content(
+			&version_rules,
+			Some(&json!({ "users_default": 50 })),
+			None,
+			&RoomPreset::PrivateChat,
+			users,
+		)
+		.expect("power levels content");
+
+		assert_eq!(content["users_default"], json!(50));
+		assert_eq!(content["users"][creator.as_str()], json!(100));
+	}
 }

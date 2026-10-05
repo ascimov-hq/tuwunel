@@ -12,10 +12,10 @@ use std::{
 use super::Config;
 use crate::{Result, implement};
 
-/// The configuration manager is an indirection to reload the configuration for
-/// the server while it is running. In order to not burden or clutter the many
-/// callsites which query for configuration items, this object implements Deref
-/// for the actively loaded configuration.
+/// Provides transparent access to the server's reloadable configuration.
+///
+/// `Deref` exposes the active [`Config`], so callers can read configuration
+/// values without handling the indirection required for reloads.
 pub struct Manager {
 	active: AtomicPtr<Config>,
 }
@@ -113,13 +113,13 @@ fn load_miss(
 	index: usize,
 	config: *const Config,
 ) -> &'static Arc<Config> {
-	// SAFETY: The active pointer was set prior and always remains valid. We're
-	// reconstituting the Arc here but as a new reference, so the count is
-	// incremented. This instance will be cached in the thread-local.
-	let config = unsafe {
-		Arc::increment_strong_count(config);
-		Arc::from_raw(config)
-	};
+	// SAFETY: The active pointer was set prior and always remains valid. The
+	// count is incremented for the new reference reconstituted below.
+	unsafe { Arc::increment_strong_count(config) };
+
+	// SAFETY: Reconstitutes the Arc against the increment above. This instance
+	// will be cached in the thread-local.
+	let config = unsafe { Arc::from_raw(config) };
 
 	// SAFETY: See the note on the transmute above. The caller should not hold more
 	// than one reference at a time directly into Config, as the second access

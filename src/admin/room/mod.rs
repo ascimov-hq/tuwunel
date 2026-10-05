@@ -1,20 +1,23 @@
 mod alias;
+mod clear_soft_failed_events;
 mod delete;
 mod directory;
 mod exists;
 mod info;
 mod list;
+mod list_extremities;
+mod list_joined_members;
 mod moderation;
 mod prune_empty;
+mod prune_extremities;
 mod purge_user;
 
 use clap::Subcommand;
-use ruma::OwnedRoomId;
+use ruma::{OwnedRoomId, OwnedRoomOrAliasId};
 use tuwunel_core::Result;
 
 use self::{
-	alias::RoomAliasCommand, directory::RoomDirectoryCommand, info::RoomInfoCommand,
-	moderation::RoomModerationCommand,
+	alias::RoomAliasCommand, directory::RoomDirectoryCommand, moderation::RoomModerationCommand,
 };
 use crate::admin_command_dispatch;
 
@@ -39,9 +42,24 @@ pub(super) enum RoomCommand {
 		no_details: bool,
 	},
 
-	#[command(subcommand)]
-	/// - View information about a room we know about
-	Info(RoomInfoCommand),
+	/// - Get general information about a room
+	///
+	/// Shows the room's name, topic, canonical alias, local aliases, and
+	/// admins (users with a power level greater than or equal to
+	/// state_default).
+	Info {
+		/// Room ID or alias
+		room: OwnedRoomOrAliasId,
+	},
+
+	/// - List joined members in a room
+	ListJoinedMembers {
+		room_id: OwnedRoomId,
+
+		/// Lists only our local users in the specified room
+		#[arg(long)]
+		local_only: bool,
+	},
 
 	#[command(subcommand)]
 	/// - Manage moderation of remote or local rooms
@@ -60,6 +78,16 @@ pub(super) enum RoomCommand {
 		room_id: OwnedRoomId,
 	},
 
+	/// - Clear stored soft-fail and policy decisions for a room
+	///
+	/// Changes stored moderation state so matching events are re-checked on the
+	/// next delivery instead of waiting out the retry window. Does not replay
+	/// or insert events.
+	ClearSoftFailedEvents {
+		/// Room ID or alias
+		room_id: OwnedRoomOrAliasId,
+	},
+
 	/// - Delete room
 	Delete {
 		room_id: OwnedRoomId,
@@ -72,6 +100,23 @@ pub(super) enum RoomCommand {
 	PruneEmpty {
 		#[arg(short, long)]
 		force: bool,
+	},
+
+	/// - List a room's forward extremities with a total
+	ListExtremities {
+		room_id: OwnedRoomOrAliasId,
+	},
+
+	/// - Scored prune of a room's forward extremities down to a target
+	PruneExtremities {
+		room_id: OwnedRoomOrAliasId,
+
+		/// Target frontier size (default: forward_extremities_max, min 1)
+		target: Option<usize>,
+
+		/// Show the plan without writing
+		#[arg(long)]
+		dry_run: bool,
 	},
 
 	/// - Delete every room a user is joined to

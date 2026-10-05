@@ -6,7 +6,7 @@ use futures::{
 	future::{join, join4, join5},
 };
 use ruma::{
-	OwnedRoomId, RoomId, ServerName, UInt, UserId,
+	OwnedRoomAliasId, OwnedRoomId, RoomAliasId, RoomId, ServerName, UInt, UserId,
 	api::{
 		client::{
 			directory::{
@@ -145,33 +145,39 @@ pub(crate) async fn set_room_visibility_route(
 					body.room_id
 				);
 
-				if services.server.config.admin_room_notices {
-					services
-						.admin
-						.send_text(&format!(
-							"Non-admin user {sender_user} tried to publish {0} to the room \
-							 directory while \"lockdown_public_room_directory\" is enabled",
-							body.room_id
-						))
-						.await;
-				}
+				services
+					.admin
+					.notify_loud(&format!(
+						"Non-admin user {sender_user} tried to publish {0} to the room \
+						 directory while \"lockdown_public_room_directory\" is enabled",
+						body.room_id
+					))
+					.await;
 
 				return Err!(Request(Forbidden(
 					"Publishing rooms to the room directory is not allowed",
 				)));
 			}
 
-			services.directory.set_public(&body.room_id);
+			// Preserve the alias the room was published under.
+			let published_alias = services
+				.directory
+				.published_alias(&body.room_id)
+				.await
+				.ok();
 
-			if services.server.config.admin_room_notices {
-				services
-					.admin
-					.send_text(&format!(
-						"{sender_user} made {} public to the room directory",
-						body.room_id
-					))
-					.await;
-			}
+			services
+				.directory
+				.set_public(&body.room_id, published_alias.as_deref());
+
+			services
+				.admin
+				.notify_loud(&format!(
+					"{sender_user} made {} public to the room directory",
+					body.room_id
+				))
+				.await;
+
 			info!("{sender_user} made {0} public to the room directory", body.room_id);
 		},
 		| room::Visibility::Private => services.directory.set_not_public(&body.room_id),
@@ -396,21 +402,7 @@ async fn public_rooms_chunk(services: &Services, room_id: OwnedRoomId) -> Public
 		.get_room_type(&room_id)
 		.ok();
 
-	let canonical_alias = services
-		.state_accessor
-		.get_canonical_alias(&room_id)
-		.ok()
-		.then(async |alias| {
-			if let Some(alias) = alias
-				&& services.globals.alias_is_local(&alias)
-				&& let Ok(alias_room_id) = services.alias.resolve_local_alias(&alias).await
-				&& alias_room_id == room_id
-			{
-				Some(alias)
-			} else {
-				None
-			}
-		});
+	let canonical_alias = directory_alias(services, &room_id);
 
 	let avatar_url = services
 		.state_accessor
@@ -465,6 +457,35 @@ async fn public_rooms_chunk(services: &Services, room_id: OwnedRoomId) -> Public
 		topic,
 		world_readable,
 	}
+}
+
+/// Alias for the room's directory entry: the alias it was published under
+/// while it still resolves to the room, else the room's canonical alias.
+async fn directory_alias(services: &Services, room_id: &RoomId) -> Option<OwnedRoomAliasId> {
+	if let Ok(alias) = services.directory.published_alias(room_id).await
+		&& alias_resolves_to(services, &alias, room_id).await
+	{
+		return Some(alias);
+	}
+
+	let alias = services
+		.state_accessor
+		.get_canonical_alias(room_id)
+		.await
+		.ok()?;
+
+	alias_resolves_to(services, &alias, room_id)
+		.await
+		.then_some(alias)
+}
+
+async fn alias_resolves_to(services: &Services, alias: &RoomAliasId, room_id: &RoomId) -> bool {
+	services.globals.alias_is_local(alias)
+		&& services
+			.alias
+			.resolve_local_alias(alias)
+			.await
+			.is_ok_and(|resolved| resolved == room_id)
 }
 
 fn check_server_banned(services: &Services, server: Option<&ServerName>) -> Result {

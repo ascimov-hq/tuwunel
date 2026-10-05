@@ -1,5 +1,6 @@
 use ruma::{OwnedRoomOrAliasId, OwnedUserId};
 use tuwunel_core::{Err, Result, debug_warn};
+use tuwunel_service::membership::Join;
 
 use super::BULK_JOIN_REASON;
 use crate::{admin_command, utils::parse_active_local_user_id};
@@ -49,6 +50,12 @@ pub(super) async fn force_join_list_of_local_users(
 
 	for username in usernames {
 		match parse_active_local_user_id(self.services, username).await {
+			| Err(e) => {
+				self.services
+					.admin
+					.send_text(&format!("{username} is not a valid username, skipping over: {e}"))
+					.await;
+			},
 			| Ok(user_id) => {
 				// don't make the server service account join
 				if user_id == self.services.globals.server_user {
@@ -64,14 +71,6 @@ pub(super) async fn force_join_list_of_local_users(
 
 				user_ids.push(user_id);
 			},
-			| Err(e) => {
-				self.services
-					.admin
-					.send_text(&format!("{username} is not a valid username, skipping over: {e}"))
-					.await;
-
-				continue;
-			},
 		}
 	}
 
@@ -82,15 +81,15 @@ pub(super) async fn force_join_list_of_local_users(
 		match self
 			.services
 			.membership
-			.join(
-				&user_id,
-				&room_id,
-				Some(&room),
-				Some(String::from(BULK_JOIN_REASON)),
-				&servers,
-				false,
-				None,
-			)
+			.join(Join {
+				sender_user: &user_id,
+				room_id: &room_id,
+				orig_room_id: Some(&room),
+				reason: Some(String::from(BULK_JOIN_REASON)),
+				servers: &servers,
+				is_appservice: false,
+				extra_content: None,
+			})
 			.await
 		{
 			| Ok(_res) => {

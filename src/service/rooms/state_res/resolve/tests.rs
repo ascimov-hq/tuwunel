@@ -1,4 +1,8 @@
-use std::{collections::HashMap, iter::once};
+use std::{
+	collections::HashMap,
+	iter::once,
+	sync::atomic::{AtomicUsize, Ordering},
+};
 
 use futures::StreamExt;
 use maplit::hashmap;
@@ -14,6 +18,7 @@ use ruma::{
 	uint,
 };
 use serde_json::{json, value::to_raw_value as to_raw_json_value};
+use tokio::sync::{Notify, watch::channel as watch_channel};
 use tuwunel_core::{
 	debug,
 	matrix::{Event, EventTypeExt, PduEvent},
@@ -95,7 +100,7 @@ async fn test_event_sort() {
 }
 
 #[tokio::test]
-async fn test_sort() {
+async fn sort() {
 	for _ in 0..20 {
 		// since we shuffle the eventIds before we sort them introducing randomness
 		// seems like we should test this a few times
@@ -439,7 +444,7 @@ async fn topic_setting() {
 }
 
 #[tokio::test]
-async fn test_event_map_none() {
+async fn event_map_none() {
 	_ = tracing::subscriber::set_default(
 		tracing_subscriber::fmt()
 			.with_test_writer()
@@ -485,7 +490,7 @@ async fn test_event_map_none() {
 	clippy::iter_on_single_items,
 	clippy::iter_on_empty_collections
 )]
-async fn test_reverse_topological_power_sort() {
+async fn reverse_topological_power_sort() {
 	_ = tracing::subscriber::set_default(
 		tracing_subscriber::fmt()
 			.with_test_writer()
@@ -927,6 +932,154 @@ async fn auth_difference_single_set() {
 	let result = auth_difference_result(vec![auth_set(&["a", "b", "c"])]).await;
 
 	assert!(result.is_empty());
+}
+
+// The subgraph is only events on `auth_events` paths between conflicted events
+// (MSC4297); a visited side branch must not leak in via a later sibling's path.
+
+#[tokio::test]
+async fn conflicted_subgraph_excludes_visited_side_branch() {
+	let topic = || to_raw_json_value(&json!({})).unwrap();
+
+	let events: HashMap<OwnedEventId, PduEvent> = vec![
+		to_init_pdu_event("CONF_X", alice(), TimelineEventType::RoomTopic, Some(""), topic()),
+		to_init_pdu_event("GHOST", alice(), TimelineEventType::RoomTopic, Some(""), topic()),
+		to_pdu_event(
+			"MID_B",
+			alice(),
+			TimelineEventType::RoomTopic,
+			Some(""),
+			topic(),
+			&["CONF_X"],
+			&[],
+		),
+		to_pdu_event(
+			"MID_A",
+			alice(),
+			TimelineEventType::RoomTopic,
+			Some(""),
+			topic(),
+			&["MID_B", "GHOST"],
+			&[],
+		),
+		to_pdu_event(
+			"CONF_S",
+			alice(),
+			TimelineEventType::RoomTopic,
+			Some(""),
+			topic(),
+			&["MID_A", "GHOST"],
+			&[],
+		),
+	]
+	.into_iter()
+	.map(|event| (event.event_id().to_owned(), event))
+	.collect();
+
+	let conflicted = [event_id("CONF_S"), event_id("CONF_X")];
+	let conflicted: Vec<_> = conflicted.iter().collect();
+
+	let mut subgraph: Vec<OwnedEventId> =
+		super::conflicted_subgraph_dfs(&conflicted, &async |id| {
+			events.get(&id).cloned().ok_or_else(not_found)
+		})
+		.collect()
+		.await;
+
+	subgraph.sort_unstable();
+
+	assert_eq!(subgraph, vec![
+		event_id("CONF_S"),
+		event_id("CONF_X"),
+		event_id("MID_A"),
+		event_id("MID_B"),
+	]);
+}
+
+#[tokio::test]
+async fn conflicted_subgraph_waits_for_inflight_convergence() {
+	let topic = || to_raw_json_value(&json!({})).unwrap();
+	let s1 = event_id("S1");
+	let s2 = event_id("S2");
+	let t = event_id("T");
+	let x = event_id("X");
+	let y = event_id("Y");
+
+	let events: HashMap<OwnedEventId, PduEvent> = vec![
+		to_pdu_event("S1", alice(), TimelineEventType::RoomTopic, Some(""), topic(), &["X"], &[]),
+		to_pdu_event("S2", alice(), TimelineEventType::RoomTopic, Some(""), topic(), &["Y"], &[]),
+		to_init_pdu_event("T", alice(), TimelineEventType::RoomTopic, Some(""), topic()),
+		to_pdu_event("X", alice(), TimelineEventType::RoomTopic, Some(""), topic(), &["T"], &[]),
+		to_pdu_event("Y", alice(), TimelineEventType::RoomTopic, Some(""), topic(), &["X"], &[]),
+	]
+	.into_iter()
+	.map(|event| (event.event_id().to_owned(), event))
+	.collect();
+
+	let x_started = Notify::new();
+	let (y_returned, y_gate) = watch_channel(false);
+	let x_fetches = AtomicUsize::new(0);
+	let conflicted = vec![&s1, &s2, &t];
+
+	let mut subgraph: Vec<OwnedEventId> =
+		super::conflicted_subgraph_dfs(&conflicted, &async |id| {
+			if id == s2 {
+				x_started.notified().await;
+			}
+
+			if id == x {
+				x_fetches.fetch_add(1, Ordering::Relaxed);
+				x_started.notify_one();
+				y_gate
+					.clone()
+					.wait_for(|returned| *returned)
+					.await
+					.expect("the Y fetch gate should remain open");
+			}
+
+			if id == y {
+				y_returned
+					.send(true)
+					.expect("the X fetch should still be waiting");
+			}
+
+			events.get(&id).cloned().ok_or_else(not_found)
+		})
+		.collect()
+		.await;
+
+	subgraph.sort_unstable();
+
+	assert_eq!(subgraph, vec![s1, s2, t, x, y]);
+	assert_eq!(x_fetches.load(Ordering::Relaxed), 1);
+}
+
+// A walker that owns an unresolved node must prune an edge back to it rather
+// than park on itself, which would strand the walker and truncate the result.
+#[tokio::test]
+async fn conflicted_subgraph_prunes_self_referential_auth_edge() {
+	let topic = || to_raw_json_value(&json!({})).unwrap();
+	let s = event_id("S");
+	let t = event_id("T");
+
+	let events: HashMap<OwnedEventId, PduEvent> = vec![
+		to_pdu_event("S", alice(), TimelineEventType::RoomTopic, Some(""), topic(), &["X"], &[]),
+		to_init_pdu_event("T", alice(), TimelineEventType::RoomTopic, Some(""), topic()),
+		to_pdu_event("X", alice(), TimelineEventType::RoomTopic, Some(""), topic(), &["X"], &[]),
+	]
+	.into_iter()
+	.map(|event| (event.event_id().to_owned(), event))
+	.collect();
+
+	let conflicted = vec![&s, &t];
+
+	let subgraph: Vec<OwnedEventId> = super::conflicted_subgraph_dfs(&conflicted, &async |id| {
+		events.get(&id).cloned().ok_or_else(not_found)
+	})
+	.collect()
+	.await;
+
+	assert!(subgraph.is_empty(), "a cyclic auth edge lies on no conflicted path");
 }
 
 // `mainline_sort`: events with no power-levels ancestor in their auth chain

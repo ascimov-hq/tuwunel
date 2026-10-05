@@ -22,6 +22,7 @@ mod rev_keys_prefix;
 mod rev_stream;
 mod rev_stream_from;
 mod rev_stream_prefix;
+mod seek;
 mod stream;
 mod stream_from;
 mod stream_prefix;
@@ -86,6 +87,9 @@ impl Map {
 
 	#[inline]
 	pub(crate) fn cf(&self) -> impl AsColumnFamilyRef + '_ { &*self.cf }
+
+	#[inline]
+	pub(crate) fn cf_id(&self) -> u32 { self.cf().id() }
 }
 
 impl Debug for Map {

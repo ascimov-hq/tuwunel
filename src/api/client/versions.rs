@@ -1,5 +1,6 @@
 use std::iter::once;
 
+use axum::extract::State;
 use ruma::api::client::discovery::get_supported_versions::{self, Server};
 use tuwunel_core::{
 	Result,
@@ -22,6 +23,7 @@ use crate::Ruma;
 /// Note: Unstable features are used while developing new features. Clients
 /// should avoid using unstable features in their stable releases
 pub(crate) async fn get_supported_versions_route(
+	State(services): State<crate::State>,
 	_body: Ruma<get_supported_versions::Request>,
 ) -> Result<get_supported_versions::Response> {
 	// MSC4383: client-side parity with /_matrix/federation/v1/version.
@@ -35,6 +37,18 @@ pub(crate) async fn get_supported_versions_route(
 
 		unstable_features: UNSTABLE_FEATURES
 			.into_iter()
+			.chain(
+				services
+					.config
+					.rendezvous_enabled
+					.then_some("org.matrix.msc4108"),
+			)
+			.chain(
+				services
+					.config
+					.beeper_batch_send
+					.then_some("com.beeper.batch_sending"),
+			)
 			.map(Into::into)
 			.zip(once(true).cycle())
 			.collect(),
@@ -43,7 +57,7 @@ pub(crate) async fn get_supported_versions_route(
 	})
 }
 
-static VERSIONS: [&str; 25] = [
+static VERSIONS: [&str; 27] = [
 	"r0.0.1", /* Historical */
 	"r0.1.0", /* Historical */
 	"r0.2.0", /* Historical */
@@ -69,9 +83,11 @@ static VERSIONS: [&str; 25] = [
 	"v1.15",  /* OIDC auth metadata */
 	"v1.16",  /* extended profiles (MSC4133) */
 	"v1.17",  /* no action */
+	"v1.18",  /* policy servers (MSC4284) */
+	"v1.19",  /* mutual rooms (MSC2666) */
 ];
 
-static UNSTABLE_FEATURES: [&str; 37] = [
+static UNSTABLE_FEATURES: [&str; 39] = [
 	"org.matrix.e2e_cross_signing",
 	// private read receipts (https://github.com/matrix-org/matrix-spec-proposals/pull/2285)
 	"org.matrix.msc2285.stable",
@@ -99,6 +115,8 @@ static UNSTABLE_FEATURES: [&str; 37] = [
 	"org.matrix.msc3916.stable",
 	// intentional mentions (https://github.com/matrix-org/matrix-spec-proposals/pull/3952)
 	"org.matrix.msc3952_intentional_mentions",
+	// MatrixRTC transport discovery (https://github.com/matrix-org/matrix-spec-proposals/pull/4143)
+	"org.matrix.msc4143",
 	// MSC4133 (custom profile fields) and MSC4175 (m.tz) stabilized in
 	// Matrix 1.16; advertise the historical unstable prefixes alongside
 	// the post-merge `.stable` flags for clients that haven't migrated.
@@ -137,6 +155,8 @@ static UNSTABLE_FEATURES: [&str; 37] = [
 	"org.matrix.msc3771",
 	// Notifications for threads (https://github.com/matrix-org/matrix-spec-proposals/pull/3773)
 	"org.matrix.msc3773",
+	// Threading via m.thread relations, stable since Matrix 1.4 (https://github.com/matrix-org/matrix-spec-proposals/pull/3440)
+	"org.matrix.msc3440.stable",
 	// state_after on /sync (https://github.com/matrix-org/matrix-spec-proposals/pull/4222)
 	"org.matrix.msc4222",
 	// Beeper room yeeting: full room purge on delete (POST .../com.beeper.yeet/rooms/{roomId}/delete)

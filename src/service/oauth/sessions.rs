@@ -33,10 +33,11 @@ struct Data {
 	userid_oauthid: Arc<Map>,
 }
 
-/// Session ultimately represents an OAuth authorization session yielding an
-/// associated matrix user registration. Maintains the state between
-/// authorization steps and the association to the matrix user until
-/// deactivation or revocation.
+/// Persistent state for one upstream OAuth authorization.
+///
+/// The record carries provider, redirect, PKCE, nonce, and token data across
+/// the authorization flow. Once linked, it also associates the provider
+/// identity with a Matrix user.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Session {
 	/// Identity Provider ID (the `client_id` in the configuration) associated
@@ -51,6 +52,9 @@ pub struct Session {
 
 	/// Access token to the provider.
 	pub access_token: Option<String>,
+
+	/// OIDC ID token returned by the provider.
+	pub id_token: Option<String>,
 
 	/// Duration in seconds the access_token is valid for.
 	pub expires_in: Option<u64>,

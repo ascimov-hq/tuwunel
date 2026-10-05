@@ -18,10 +18,13 @@ crate-type = [
 ]
 
 [features]
+default = [
+	"server",
+]
 brotli_compression = [
+	"reqwest/brotli",
 	"tuwunel-core/brotli_compression",
 	"tuwunel-service/brotli_compression",
-	"reqwest/brotli",
 ]
 bzip2_compression = [
 	"tuwunel-service/bzip2_compression",
@@ -30,9 +33,9 @@ element_hacks = [
 	"tuwunel-service/element_hacks",
 ]
 gzip_compression = [
+	"reqwest/gzip",
 	"tuwunel-core/gzip_compression",
 	"tuwunel-service/gzip_compression",
-	"reqwest/gzip",
 ]
 io_uring = [
 	"tuwunel-service/io_uring",
@@ -60,18 +63,24 @@ lz4_compression = [
 	"tuwunel-service/lz4_compression",
 ]
 release_max_log_level = [
-	"tuwunel-core/release_max_log_level",
-	"tuwunel-service/release_max_log_level",
 	"log/max_level_trace",
 	"log/release_max_level_info",
 	"tracing/max_level_trace",
 	"tracing/release_max_level_info",
+	"tuwunel-core/release_max_log_level",
+	"tuwunel-service/release_max_log_level",
 ]
 zstd_compression = [
+	"reqwest/zstd",
 	"tuwunel-core/zstd_compression",
 	"tuwunel-service/zstd_compression",
-	"reqwest/zstd",
 ]
+
+# Required by ruma's `#[request]`/`#[response]` macros for the endpoint types
+# this crate defines itself (e.g. Beeper room yeeting): `server` enables the
+# generated `IncomingRequest`/`OutgoingResponse` impls; `client` is never used.
+client = []
+server = []
 
 [dependencies]
 axum-extra.workspace = true
@@ -99,6 +108,8 @@ sha1.workspace = true
 synapse-admin-api.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tower.workspace = true
+tower-http.workspace = true
 tuwunel-core.workspace = true
 tuwunel-service.workspace = true
 url.workspace = true

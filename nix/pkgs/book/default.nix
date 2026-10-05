@@ -20,6 +20,7 @@ stdenv.mkDerivation {
       "README.md"
       "development.md"
       "debian/tuwunel.service"
+      "debian/units/tuwunel.socket"
       "debian/README.md"
       "arch/tuwunel.service"
       "rpm/tuwunel.service"

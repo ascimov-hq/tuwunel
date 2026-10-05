@@ -1,4 +1,9 @@
-use super::fed::{FedDest, add_port_to_hostname, get_ip_with_port};
+use std::net::IpAddr;
+
+use super::{
+	dns::Resolver,
+	fed::{FedDest, add_port_to_hostname, get_ip_with_port},
+};
 
 #[test]
 fn ips_get_default_ports() {
@@ -38,4 +43,58 @@ fn hostnames_keep_custom_ports() {
 		add_port_to_hostname("example.com:1337"),
 		FedDest::Named("example.com".into(), ":1337".try_into().unwrap())
 	);
+}
+
+#[test]
+fn eviction_key_matches_delegated_override_key() {
+	// Overrides are keyed by the delegated host without a port; eviction derives
+	// the same key from the resolved destination via `hostname()`, not origin.
+	let delegated = add_port_to_hostname("delegated.example");
+	let with_port = FedDest::Named("delegated.example".into(), ":8449".try_into().unwrap());
+
+	assert_eq!(delegated.hostname().as_str(), "delegated.example");
+	assert_eq!(with_port.hostname().as_str(), "delegated.example");
+	assert_ne!(delegated.hostname().as_str(), "origin.example");
+}
+
+#[test]
+fn nameservers_get_default_ports() {
+	let conf = Resolver::parse_nameserver("1.1.1.1").unwrap();
+
+	assert_eq!(conf.ip, "1.1.1.1".parse::<IpAddr>().unwrap());
+	assert!(!conf.connections.is_empty());
+	assert!(
+		conf.connections
+			.iter()
+			.all(|conn| conn.port == 53)
+	);
+}
+
+#[test]
+fn nameservers_keep_custom_ports() {
+	let conf = Resolver::parse_nameserver("127.0.0.1:5353").unwrap();
+
+	assert_eq!(conf.ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+	assert!(!conf.connections.is_empty());
+	assert!(
+		conf.connections
+			.iter()
+			.all(|conn| conn.port == 5353)
+	);
+
+	let conf = Resolver::parse_nameserver("[dead::beef]:5353").unwrap();
+
+	assert_eq!(conf.ip, "dead::beef".parse::<IpAddr>().unwrap());
+	assert!(!conf.connections.is_empty());
+	assert!(
+		conf.connections
+			.iter()
+			.all(|conn| conn.port == 5353)
+	);
+}
+
+#[test]
+fn nameservers_reject_hostnames() {
+	Resolver::parse_nameserver("dns.example.com").unwrap_err();
+	Resolver::parse_nameserver("").unwrap_err();
 }

@@ -1,7 +1,9 @@
 #![cfg(test)]
 
 use ruma::{EventId, RoomId, UserId};
-use tuwunel_database::{Interfix, SEP, serialize_to_vec};
+use tuwunel_database::{
+	Ignore, IgnoreAll, Interfix, SEP, deserialize_from_slice, serialize_to_vec,
+};
 
 const ROOM: &str = "!room:example.com";
 const USER: &str = "@user:example.com";
@@ -60,4 +62,14 @@ fn thread_prefix_sweep_preserves_main() {
 	assert!(a.starts_with(&prefix));
 	assert!(b.starts_with(&prefix));
 	assert!(!main.starts_with(&prefix));
+}
+
+#[test]
+fn notification_key_room_survives_main_and_thread_tail() {
+	for key in [main_key(), thread_key(root_a())] {
+		let (_, room_id, _): (Ignore, &RoomId, IgnoreAll) =
+			deserialize_from_slice(&key).expect("deserialize notification key");
+
+		assert_eq!(room_id, room());
+	}
 }

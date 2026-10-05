@@ -45,25 +45,30 @@ underlying OAuth behavior.
 
 ## Enabling the server
 
-The OIDC server activates automatically once both of these are present:
-
-1. At least one `[[global.identity_provider]]` block (see
-   [Identity Providers](providers.md)). This is the upstream that actually
-   authenticates users.
-2. A client well-known base URL, which becomes the OAuth **issuer** URL:
+The OIDC server needs a client well-known base URL, which becomes the OAuth
+**issuer** URL:
 
 ```toml
 [global.well_known]
 client = "https://matrix.example.com"
 ```
 
-If only one of the two is present, the server logs a warning at startup and
-does not start. Legacy SSO (the `m.login.sso` flow) keeps working without it,
-so configuring an identity provider alone does not break anything; it only
-leaves next-gen auth dormant until you set `well_known.client`.
+It then activates once at least one way to authenticate users is configured.
+Choose either or both:
+
+1. **Native accounts.** Set `oidc_native_auth = true` to let clients register
+   and log in against this server's own accounts, with no third-party provider
+   (see [Native authentication](#native-authentication)).
+2. **An upstream identity provider.** Add at least one
+   `[[global.identity_provider]]` block (see [Identity Providers](providers.md))
+   to broker authentication to an external IdP.
+
+If `well_known.client` is set but neither source is configured, the server logs
+a warning at startup and does not start. Legacy SSO (the `m.login.sso` flow)
+keeps working regardless.
 
 ```
-OIDC server (Next-gen auth) requires `well_known.client` to be configured to serve your `identity_provider`.
+OIDC server (Next-gen auth) requires `well_known.client` to be configured.
 ```
 
 ## How a login flows
@@ -91,6 +96,12 @@ The device that results is tagged with the provider that authenticated it, so
 later step-up actions (see [Cross-signing protection](#cross-signing-protection))
 re-authenticate against the same provider.
 
+When native authentication is enabled and the request selects no upstream
+provider (or carries `prompt=create`), step 3 instead serves a local
+login/registration page at `GET /_tuwunel/oidc/native`. The user authenticates
+against a local account and the flow rejoins at `_complete` exactly as above.
+See [Native authentication](#native-authentication).
+
 ## Endpoints
 
 ### Discovery
@@ -114,6 +125,7 @@ grant.
 |---|---|---|
 | `GET` | `/_tuwunel/oidc/authorize` | Authorization endpoint; starts the code flow |
 | `GET` | `/_tuwunel/oidc/_complete` | Completes authorization after the provider callback |
+| `GET`/`POST` | `/_tuwunel/oidc/native` | Native login/registration page and submission (no upstream IdP) |
 | `POST` | `/_tuwunel/oidc/token` | Token endpoint; exchanges codes, refresh tokens, and device codes |
 | `POST` | `/_tuwunel/oidc/device_authorization` | Device authorization request (RFC 8628) |
 | `GET` | `/_tuwunel/oidc/device` | User-code verification page |
@@ -183,6 +195,20 @@ behavior, so an existing deployment is unaffected until you opt in.
 | `refresh_token_hard_logout` | `false` | When `false`, an expired refresh token is rejected with `soft_logout: true`, letting the client keep its E2EE keys and resume the same device after re-auth. When `true`, expiry deletes the device entirely and signals `soft_logout: false`, so the next session is a fresh device. |
 | `refresh_token_reuse_grace` | `15` | Grace window in seconds for a benign double-submit. If a just-rotated refresh token is replayed within this window while its successor is still current, Tuwunel treats it as a client that lost the rotated response and reissues, rather than revoking. Set to `0` to treat every replay strictly. |
 | `refresh_token_reuse_revoke` | `true` | When `true`, a refresh token replayed outside the grace window removes the device. When `false`, the replay is rejected but the device is left intact, which an operator fronting another OAuth client may prefer. |
+
+### Native authentication
+
+| Option | Default | Description |
+|---|---|---|
+| `oidc_native_auth` | `false` | When `true`, the OIDC server serves a local login and registration page for clients that select no upstream provider, authenticating against this server's own accounts. Requires `well_known.client`. Coexists with configured identity providers. |
+
+With native auth enabled, an authorization request that selects no provider (or
+carries `prompt=create`) is served `GET /_tuwunel/oidc/native` instead of an SSO
+redirect. Registration there enforces the same `allow_registration`,
+registration-token, and `registration_terms` policy as the Matrix registration
+endpoint, and the metadata document advertises `prompt_values_supported =
+["create"]` so clients can offer account creation. Enabling this knob where the
+OIDC server was not already running takes effect on the next restart.
 
 ### Authorization hardening
 

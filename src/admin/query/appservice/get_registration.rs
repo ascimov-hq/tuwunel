@@ -1,18 +1,13 @@
-use tokio::time::Instant;
 use tuwunel_core::Result;
 
 use crate::admin_command;
 
 #[admin_command]
 pub(super) async fn appservice_get_registration(&self, appservice_id: String) -> Result {
-	let timer = Instant::now();
-	let results = self
+	let query = self
 		.services
 		.appservice
-		.get_registration(&appservice_id)
-		.await;
+		.get_registration(&appservice_id);
 
-	let query_time = timer.elapsed();
-
-	write!(self, "Query completed in {query_time:?}:\n\n```rs\n{results:#?}\n```").await
+	self.write_timed_query(query).await
 }

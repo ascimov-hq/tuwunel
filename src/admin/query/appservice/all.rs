@@ -1,20 +1,15 @@
 use futures::TryStreamExt;
-use tokio::time::Instant;
 use tuwunel_core::Result;
 
 use crate::admin_command;
 
 #[admin_command]
 pub(super) async fn appservice_all(&self) -> Result {
-	let timer = Instant::now();
-	let results: Vec<_> = self
+	let query = self
 		.services
 		.appservice
 		.iter_db_ids()
-		.try_collect()
-		.await?;
+		.try_collect::<Vec<_>>();
 
-	let query_time = timer.elapsed();
-
-	write!(self, "Query completed in {query_time:?}:\n\n```rs\n{results:#?}\n```").await
+	self.write_timed_query_try(query).await
 }

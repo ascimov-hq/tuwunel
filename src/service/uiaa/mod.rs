@@ -8,7 +8,10 @@ use futures::{TryStreamExt, pin_mut};
 use ruma::{
 	CanonicalJsonValue, DeviceId, OwnedDeviceId, OwnedUserId, UserId,
 	api::{
-		client::uiaa::{AuthData, AuthType, EmailIdentity, Password, UiaaInfo, UserIdentifier},
+		client::uiaa::{
+			AuthData, AuthType, EmailIdentity, Password, ThirdpartyIdCredentials, UiaaInfo,
+			UserIdentifier,
+		},
 		error::{ErrorKind, StandardErrorBody},
 	},
 };
@@ -22,6 +25,7 @@ use crate::users::PASSWORD_SENTINEL;
 
 pub struct Service {
 	userdevicesessionid_uiaarequest: RwLock<RequestMap>,
+	userdevicesessionid_threepid: RwLock<ThreepidMap>,
 	db: Data,
 	services: Arc<crate::services::OnceServices>,
 }
@@ -31,6 +35,7 @@ struct Data {
 }
 
 type RequestMap = BTreeMap<RequestKey, CanonicalJsonValue>;
+type ThreepidMap = BTreeMap<RequestKey, ThirdpartyIdCredentials>;
 type RequestKey = (OwnedUserId, OwnedDeviceId, String);
 
 pub const SESSION_ID_LENGTH: usize = 32;
@@ -39,6 +44,7 @@ impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		Ok(Arc::new(Self {
 			userdevicesessionid_uiaarequest: RwLock::new(RequestMap::new()),
+			userdevicesessionid_threepid: RwLock::new(ThreepidMap::new()),
 			db: Data {
 				userdevicesessionid_uiaainfo: args.db["userdevicesessionid_uiaainfo"].clone(),
 			},
@@ -112,10 +118,10 @@ pub async fn try_auth(
 					.completed
 					.push(AuthType::RegistrationToken);
 			} else {
-				uiaainfo.auth_error = Some(StandardErrorBody {
+				uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
 					kind: ErrorKind::forbidden(),
 					message: "Invalid registration token.".to_owned(),
-				});
+				}));
 
 				return Ok((false, uiaainfo));
 			}
@@ -136,11 +142,11 @@ pub async fn try_auth(
 				{
 					uiaainfo.completed.push(AuthType::OAuth);
 				} else {
-					uiaainfo.auth_error = Some(StandardErrorBody {
+					uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
 						kind: ErrorKind::forbidden(),
 						message: "OAuth cross-signing reset not approved for this session."
 							.to_owned(),
-					});
+					}));
 
 					return Ok((false, uiaainfo));
 				}
@@ -165,15 +171,21 @@ pub async fn try_auth(
 				.await;
 
 			if !validated {
-				uiaainfo.auth_error = Some(StandardErrorBody {
+				uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
 					kind: ErrorKind::forbidden(),
 					message: "Email address has not been validated.".to_owned(),
-				});
+				}));
 
 				return Ok((false, uiaainfo));
 			}
 
 			uiaainfo.completed.push(AuthType::EmailIdentity);
+
+			// Retain the validated credentials so a later stage can still bind the email
+			// (MSC2263).
+			if let Some(session) = uiaainfo.session.as_deref() {
+				self.set_uiaa_threepid(user_id, device_id, session, thirdparty_id_creds);
+			}
 		},
 		| auth => error!("AuthData type not supported: {auth:?}"),
 	}
@@ -208,7 +220,6 @@ pub async fn try_auth(
 }
 
 #[implement(Service)]
-#[allow(clippy::useless_let_if_seq)]
 async fn verify_password(
 	&self,
 	user_id: &UserId,
@@ -276,10 +287,10 @@ async fn verify_password(
 	}
 
 	if !password_verified {
-		uiaainfo.auth_error = Some(StandardErrorBody {
+		uiaainfo.auth_error = Some(Box::new(StandardErrorBody {
 			kind: ErrorKind::forbidden(),
 			message: "Invalid username or password.".to_owned(),
-		});
+		}));
 
 		return Ok(ControlFlow::Break(false));
 	}
@@ -320,6 +331,37 @@ pub fn get_uiaa_request(
 		.expect("locked for reading")
 		.get(&key)
 		.cloned()
+}
+
+#[implement(Service)]
+fn set_uiaa_threepid(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	session: &str,
+	creds: &ThirdpartyIdCredentials,
+) {
+	let key = (user_id.to_owned(), device_id.to_owned(), session.to_owned());
+
+	self.userdevicesessionid_threepid
+		.write()
+		.expect("locked for writing")
+		.insert(key, creds.to_owned());
+}
+
+#[implement(Service)]
+pub fn take_uiaa_threepid(
+	&self,
+	user_id: &UserId,
+	device_id: &DeviceId,
+	session: &str,
+) -> Option<ThirdpartyIdCredentials> {
+	let key = (user_id.to_owned(), device_id.to_owned(), session.to_owned());
+
+	self.userdevicesessionid_threepid
+		.write()
+		.expect("locked for writing")
+		.remove(&key)
 }
 
 #[implement(Service)]

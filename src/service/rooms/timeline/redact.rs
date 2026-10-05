@@ -59,6 +59,11 @@ pub async fn redact_pdu<Pdu: Event + Send + Sync>(
 		)))
 	})?;
 
+	self.services
+		.pdu_metadata
+		.delete_typed_relation(&pdu_id, &pdu)
+		.await;
+
 	redact_in_place(
 		&mut pdu,
 		&room_version_rules.redaction,

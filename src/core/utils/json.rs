@@ -1,3 +1,9 @@
+//! Serialization helpers for raw and canonical JSON values.
+//!
+//! The conversion functions bridge Serde values to Ruma's raw and canonical
+//! representations. A generic deserializer adapts string-backed fields to types
+//! implementing `FromStr`.
+
 use std::{fmt, marker::PhantomData, str::FromStr};
 
 use ruma::{
@@ -6,16 +12,20 @@ use ruma::{
 
 use crate::Result;
 
-/// Perform a round-trip through serde_json starting with a native type T and
-/// ending with a Ruma `Raw<U>` which is usually just T.
+/// Serializes a value into Ruma's raw JSON representation.
+///
+/// The input is first converted to a `serde_json::Value`, then stored as
+/// `Raw<U>` without deserializing `U`. Serialization or JSON conversion
+/// failures are returned.
 pub fn to_raw<T: serde::Serialize, U>(input: T) -> Result<Raw<U>> {
 	Ok(serde_json::from_value(serde_json::to_value(input)?)?)
 }
 
-/// Fallible conversion from any value that implements `Serialize` to a
-/// `CanonicalJsonObject`.
+/// Converts a serializable value into a canonical JSON object.
 ///
-/// `value` must serialize to an `serde_json::Value::Object`.
+/// The value must serialize to a JSON object. Serialization errors, non-object
+/// values, and data outside canonical JSON's representation are returned as
+/// `CanonicalJsonError`.
 pub fn to_canonical_object<T: serde::Serialize>(
 	value: T,
 ) -> Result<CanonicalJsonObject, CanonicalJsonError> {
@@ -28,6 +38,10 @@ pub fn to_canonical_object<T: serde::Serialize>(
 	}
 }
 
+/// Deserializes a string and parses it through `FromStr`.
+///
+/// Only string input is accepted. Parse failures become custom deserialization
+/// errors using their `Display` messages.
 pub fn deserialize_from_str<'de, D, T, E>(deserializer: D) -> Result<T, D::Error>
 where
 	D: serde::de::Deserializer<'de>,

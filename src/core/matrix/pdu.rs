@@ -12,8 +12,11 @@ use std::cmp::Ordering;
 
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, EventId, MilliSecondsSinceUnixEpoch, OwnedEventId,
-	OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, UInt, UserId, events::TimelineEventType,
-	room_version_rules::RoomVersionRules, serde::Raw,
+	OwnedRoomId, OwnedServerName, OwnedUserId, RoomId, UInt, UserId,
+	canonical_json::redact_in_place,
+	events::TimelineEventType,
+	room_version_rules::{RedactionRules, RoomVersionRules},
+	serde::Raw,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue as RawJsonValue;
@@ -21,7 +24,7 @@ use smallvec::SmallVec;
 
 pub use self::{
 	Count as PduCount, Id as PduId, Pdu as PduEvent, RawId as RawPduId,
-	builder::{Builder, Builder as PduBuilder},
+	builder::{Builder, Builder as PduBuilder, SUPPRESS_NOTIFICATIONS, notifications_suppressed},
 	count::Count,
 	format::{
 		check::{check_room_id, check_rules},
@@ -32,7 +35,7 @@ pub use self::{
 	raw_id::*,
 };
 use super::{Event, ShortRoomId, StateKey};
-use crate::Result;
+use crate::{Result, err};
 
 /// Persistent Data Unit (Event)
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -76,25 +79,30 @@ pub struct Pdu {
 	pub rejected: bool,
 }
 
-/// Tuned prev_events vector. Most events have one prev_event. Many events have
-/// more but allocations for all of those cases still beats allocations for all
-/// cases.
+/// Inline storage for the common single-entry `prev_events` case.
+///
+/// Events with additional predecessors spill to the heap, avoiding larger
+/// inline storage on every event.
 pub type PrevEvents = SmallVec<[OwnedEventId; 1]>;
 
-/// Tuned auth_events vector. Average events have three auth events. It is
-/// debatable whether this could be an ArrayVec but the realistic upper-bound is
-/// too high and non-deterministic in the era of restricted-type rooms.
+/// Inline storage for the typical three-entry `auth_events` case.
+///
+/// Restricted rooms can require many more entries, so this remains a spilling
+/// `SmallVec` rather than a fixed-capacity `ArrayVec`.
 pub type AuthEvents = SmallVec<[OwnedEventId; 3]>;
 
-/// Tuned content buffer. This was chosen empirically based on a significantly
-/// high-rate modality in the 96-112B size class reported by jemalloc. With two
-/// additional words (hopefully) for the SmallVec it puts us squarely at 128B.
+/// Raw event-content storage with 112 bytes of inline capacity.
+///
+/// The capacity follows an allocator-profile mode in the 96 to 112 byte range
+/// and targets a 128 byte total size with `SmallVec` metadata.
 pub type Content = Raw<CanonicalJsonObject, 112>;
 
-/// Tuned unsigned buffer. The stored value is `None` or small (the local-send
-/// `transaction_id` echo, or a serve-time `age`/`membership` annotation), all
-/// of which stay inline at the `Content` size class. State-event `prev_content`
-/// and bundled `m.relations` exceed it and spill to the heap, which is correct.
+/// Raw `unsigned` storage with 112 bytes of inline capacity.
+///
+/// The enclosing field is usually `None` or contains a small local annotation,
+/// such as `transaction_id`, `age`, or `membership`. Those values remain inline
+/// at the `Content` size class, while larger state-event `prev_content` and
+/// bundled `m.relations` values spill to the heap.
 pub type Unsigned = Raw<CanonicalJsonObject, 112>;
 
 /// The [maximum size allowed] for a PDU.
@@ -165,6 +173,18 @@ impl Pdu {
 
 	pub fn from_raw_json(json: &RawJsonValue) -> Result<Self> {
 		Self::deserialize(json).map_err(Into::into)
+	}
+
+	/// MSC4025: a pruned clone per the redaction rules, carrying no
+	/// `redacted_because`; no redaction event exists for a serve-time
+	/// erasure.
+	pub fn redacted(&self, rules: &RedactionRules) -> Result<Self> {
+		let mut object = self.to_canonical_object();
+
+		redact_in_place(&mut object, rules, None)
+			.map_err(|e| err!("Failed to redact event: {e}"))?;
+
+		Self::from_object(object)
 	}
 }
 

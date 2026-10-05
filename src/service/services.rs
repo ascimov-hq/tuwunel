@@ -12,11 +12,12 @@ use crate::{
 	account_data, admin, appservice, client, config, deactivate, emergency, federation, fetcher,
 	globals, key_backups,
 	manager::Manager,
-	media, membership, oauth, presence, pusher, registration_tokens, resolver,
+	media, membership, oauth, presence, profile, pusher, registration_tokens, rendezvous,
+	resolver,
 	rooms::{self, retention},
 	sending, sendmail, server_keys,
 	service::{Args, Service},
-	storage, sync, threepid, transaction_ids, uiaa, users,
+	storage, sync, tasks, threepid, transaction_ids, uiaa, users,
 };
 
 pub struct Services {
@@ -57,6 +58,7 @@ pub struct Services {
 	pub sending: Arc<sending::Service>,
 	pub server_keys: Arc<server_keys::Service>,
 	pub sync: Arc<sync::Service>,
+	pub tasks: Arc<tasks::Service>,
 	pub transaction_ids: Arc<transaction_ids::Service>,
 	pub uiaa: Arc<uiaa::Service>,
 	pub users: Arc<users::Service>,
@@ -65,8 +67,10 @@ pub struct Services {
 	pub oauth: Arc<oauth::Service>,
 	pub retention: Arc<retention::Service>,
 	pub registration_tokens: Arc<registration_tokens::Service>,
+	pub rendezvous: Arc<rendezvous::Service>,
 	pub sendmail: Arc<sendmail::Service>,
 	pub threepid: Arc<threepid::Service>,
+	pub profile: Arc<profile::Service>,
 
 	manager: Mutex<Option<Arc<Manager>>>,
 	pub server: Arc<Server>,
@@ -121,6 +125,7 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		sending: sending::Service::build(&args)?,
 		server_keys: server_keys::Service::build(&args)?,
 		sync: sync::Service::build(&args)?,
+		tasks: tasks::Service::build(&args)?,
 		transaction_ids: transaction_ids::Service::build(&args)?,
 		uiaa: uiaa::Service::build(&args)?,
 		users: users::Service::build(&args)?,
@@ -129,8 +134,10 @@ pub async fn build(server: Arc<Server>) -> Result<Arc<Self>> {
 		oauth: oauth::Service::build(&args)?,
 		retention: retention::Service::build(&args)?,
 		registration_tokens: registration_tokens::Service::build(&args)?,
+		rendezvous: rendezvous::Service::build(&args)?,
 		sendmail: sendmail::Service::build(&args)?,
 		threepid: threepid::Service::build(&args)?,
+		profile: profile::Service::build(&args)?,
 
 		manager: Mutex::new(None),
 		server,
@@ -186,6 +193,7 @@ pub(crate) fn services(&self) -> impl Iterator<Item = Arc<dyn Service>> + Send {
 		cast!(self.sending),
 		cast!(self.server_keys),
 		cast!(self.sync),
+		cast!(self.tasks),
 		cast!(self.transaction_ids),
 		cast!(self.uiaa),
 		cast!(self.users),
@@ -194,6 +202,8 @@ pub(crate) fn services(&self) -> impl Iterator<Item = Arc<dyn Service>> + Send {
 		cast!(self.oauth),
 		cast!(self.retention),
 		cast!(self.registration_tokens),
+		cast!(self.rendezvous),
+		cast!(self.profile),
 	]
 	.into_iter()
 }

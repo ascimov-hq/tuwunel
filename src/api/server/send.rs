@@ -1,5 +1,6 @@
 use std::{
 	collections::BTreeMap,
+	iter::once,
 	net::IpAddr,
 	sync::atomic::{AtomicBool, Ordering},
 	time::{Duration, Instant},
@@ -8,8 +9,8 @@ use std::{
 use axum::extract::State;
 use futures::{FutureExt, Stream, StreamExt, TryFutureExt, TryStreamExt};
 use ruma::{
-	CanonicalJsonObject, CanonicalJsonValue, MilliSecondsSinceUnixEpoch, OwnedEventId,
-	OwnedRoomId, OwnedUserId, RoomId, ServerName, TransactionId, UserId,
+	CanonicalJsonObject, CanonicalJsonValue, MilliSecondsSinceUnixEpoch, OwnedDeviceId,
+	OwnedEventId, OwnedRoomId, OwnedUserId, RoomId, ServerName, TransactionId, UserId,
 	api::{
 		error::ErrorKind,
 		federation::transactions::{
@@ -57,6 +58,10 @@ type RoomPdus = (OwnedRoomId, TxnPdus);
 type TxnPdus = SmallVec<[(usize, Pdu); 1]>;
 type Pdu = (OwnedRoomId, OwnedEventId, CanonicalJsonObject);
 
+/// Recipient devices of one `AllDevices` to-device send paired with their
+/// inbox counts.
+type Deliveries = SmallVec<[(OwnedDeviceId, u64); 1]>;
+
 /// # `PUT /_matrix/federation/v1/send/{txnId}`
 ///
 /// Push EDUs and PDUs to this server.
@@ -92,6 +97,12 @@ pub(crate) async fn send_transaction_message_route(
 			"Not allowed to send more than {EDU_LIMIT} EDUs in one transaction"
 		)));
 	}
+
+	// Clear any failure bucket before processing consults the peer gate.
+	services
+		.sending
+		.notify_peer_alive(body.origin())
+		.await;
 
 	let txn_start_time = Instant::now();
 	trace!(
@@ -352,7 +363,6 @@ async fn handle_pdu(
 		.event_handler
 		.handle_incoming_pdu(origin, room_id, &event_id, value, true)
 		.map_ok(|_| ())
-		.boxed()
 		.await;
 
 	completed.store(true, Ordering::Release);
@@ -673,11 +683,16 @@ async fn handle_edu_direct_to_device(
 		return;
 	}
 
-	// process messages concurrently for different users
 	let ev_type = ev_type.to_string();
+
 	messages
 		.into_iter()
 		.stream()
+		.broad_filter_map(async |(target_user_id, map)| {
+			to_device_deliverable(services, &target_user_id)
+				.await
+				.then_some((target_user_id, map))
+		})
 		.for_each_concurrent(automatic_width(), |(target_user_id, map)| {
 			handle_edu_direct_to_device_user(services, target_user_id, sender, &ev_type, map)
 		})
@@ -687,6 +702,18 @@ async fn handle_edu_direct_to_device(
 	services
 		.transaction_ids
 		.add_txnid(sender, None, message_id, &[]);
+}
+
+/// A local account we store or forward to-device events for: one that is
+/// active, or claimed by an appservice namespace so its puppet events reach the
+/// bridge.
+async fn to_device_deliverable(services: &Services, user_id: &UserId) -> bool {
+	services.globals.user_is_local(user_id)
+		&& (services.users.is_active(user_id).await
+			|| services
+				.appservice
+				.is_interested_in_user(user_id)
+				.await)
 }
 
 async fn handle_edu_direct_to_device_user<Event: Send + Sync>(
@@ -722,29 +749,70 @@ async fn handle_edu_direct_to_device_event(
 ) {
 	match target_device_id_maybe {
 		| DeviceIdOrAllDevices::DeviceId(ref target_device_id) => {
-			services.users.add_to_device_event(
+			let count = services.users.add_to_device_event(
 				sender,
 				target_user_id,
 				target_device_id,
 				ev_type,
 				&event,
 			);
+
+			services
+				.sending
+				.send_to_device_appservices(
+					sender,
+					target_user_id,
+					once((&**target_device_id, count)),
+					ev_type,
+					&event,
+				)
+				.await
+				.log_err()
+				.ok();
 		},
 
 		| DeviceIdOrAllDevices::AllDevices => {
-			services
+			let interested = services
+				.appservice
+				.is_interested_in_user(target_user_id)
+				.await;
+
+			let deliveries: Deliveries = services
 				.users
 				.all_device_ids(target_user_id)
-				.ready_for_each(|target_device_id| {
-					services.users.add_to_device_event(
+				.map(|target_device_id| {
+					let count = services.users.add_to_device_event(
 						sender,
 						target_user_id,
 						target_device_id,
 						ev_type,
 						&event,
 					);
+
+					(target_device_id, count)
 				})
+				.ready_filter_map(|(target_device_id, count)| {
+					interested.then(|| (target_device_id.to_owned(), count))
+				})
+				.collect()
 				.await;
+
+			if !deliveries.is_empty() {
+				services
+					.sending
+					.send_to_device_appservices(
+						sender,
+						target_user_id,
+						deliveries
+							.iter()
+							.map(|(device_id, count)| (&**device_id, *count)),
+						ev_type,
+						&event,
+					)
+					.await
+					.log_err()
+					.ok();
+			}
 		},
 	}
 }

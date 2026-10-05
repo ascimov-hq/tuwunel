@@ -17,6 +17,9 @@ release [here](https://github.com/matrix-construct/tuwunel/releases/latest) or
 `main` CI branch workflow artifact output. These also include `.deb` packages
 for Debian or Ubuntu and `.rpm` packages for Red Hat or Fedora.
 
+Debian and Ubuntu users can instead install and update Tuwunel through the
+apt repository; see the [Debian guide](debian.md) for setup.
+
 For the **best** performance; if using an `x86_64` CPU made in the last ~10 years,
 we recommend using the `-v3-` optimised packages. See below for a command to check
 what your system supports. If the server refuses to start or exits with an "Illegal
@@ -99,6 +102,29 @@ On systems where rsyslog is used alongside journald (i.e. Red Hat-based distros
 and OpenSUSE), put `$EscapeControlCharactersOnReceive off` inside
 `/etc/rsyslog.conf` to allow color in logs.
 
+When running as a systemd service, Tuwunel submits its logs directly to
+journald with each entry's severity preserved as the journal priority, so
+`journalctl --priority warning` catches Tuwunel's warnings and errors. Each
+entry carries the same formatted message as the console output, span fields
+included, and thread ids when `log_thread_ids` is enabled. The target and
+source location are attached as journal fields, and every tracing field is
+recorded under an `F_` prefix, so a single room or event can be pulled out of
+the journal directly:
+
+```bash
+journalctl -u tuwunel F_ROOM_ID='!room:example.com'
+```
+
+Set `log_journald = false` in the config to write plain console output instead.
+A unit that sends its output to a terminal rather than the journal, as the Arch
+unit does for the interactive admin console, needs that setting to keep showing
+log lines there.
+
+The packages also ship a `tuwunel.socket` unit, disabled by default, for
+letting systemd open the listening socket instead. That is what allows the
+server to answer on a privileged port such as 443 or 8448 while holding no
+capability of its own. See [systemd socket activation](socket-activation.md).
+
 If you are using a different `database_path` other than the systemd unit
 configured default `/var/lib/tuwunel`, you need to add your path to the
 systemd unit's `ReadWritePaths=`. This can be done by either directly editing
@@ -158,6 +184,8 @@ Regardless of which reverse proxy you choose, you will need to:
    - `/_tuwunel/` - ad-hoc Tuwunel routes such as `/local_user_count` and `/server_version`
 
 2. **Optionally reverse proxy (recommended):**
+   - `/_synapse/admin/` if you use administration dashboards such as synapse-admin or moderation bots; see the [Synapse Admin API](../development/compliance/synapse-admin.md) page for the served endpoints. They require an administrator access token, but you may still prefer to restrict this path to trusted networks
+   - `/_synapse/mas/` if the Matrix Authentication Service reaches Tuwunel through the reverse proxy rather than directly; these endpoints reject every request not bearing the configured `mas_secret`
    - `/.well-known/matrix/client` and `/.well-known/matrix/server` if using Tuwunel to perform delegation (see the `[global.well_known]` config section and the [delegation example](root-domain-delegation.md))
    - `/.well-known/matrix/support` if using Tuwunel to send the homeserver admin contact and support page (formerly known as MSC1929)
    - `/` if you would like to see `hewwo from tuwunel woof!` at the root

@@ -1,5 +1,4 @@
 use ruma::{OwnedRoomId, OwnedUserId};
-use tokio::time::Instant;
 use tuwunel_core::Result;
 
 use crate::admin_command;
@@ -11,13 +10,10 @@ pub(super) async fn get_room_backups(
 	version: String,
 	room_id: OwnedRoomId,
 ) -> Result {
-	let timer = Instant::now();
-	let result = self
+	let query = self
 		.services
 		.key_backups
-		.get_room(&user_id, &version, &room_id)
-		.await;
-	let query_time = timer.elapsed();
+		.get_room(&user_id, &version, &room_id);
 
-	write!(self, "Query completed in {query_time:?}:\n\n```rs\n{result:#?}\n```").await
+	self.write_timed_query(query).await
 }

@@ -18,6 +18,14 @@ const QUANTUM: u64 = 60;
 /// Accumulated `Pending` records at which the rate brake engages.
 const SUPPRESS_AFTER: u32 = 3;
 
+/// Retry window for the `Upgrade` context.
+///
+/// Bounds how often a re-delivered event repeats the full upgrade. A
+/// soft-failed event is re-evaluated on this widening schedule rather than
+/// rejected forever, so a lapsed policy-server refusal heals.
+pub(super) const UPGRADE_RETRY: Range<Duration> =
+	Duration::from_mins(5)..Duration::from_hours(24);
+
 /// Federation step that recorded a decision; the key's leading discriminant.
 #[derive(Clone, Copy)]
 pub(super) enum Context {
@@ -121,6 +129,17 @@ pub(super) fn record_outcome(&self, ctx: Context, event_id: &EventId, dispositio
 		(u8::from(ctx), event_id, current_bucket()),
 		(u64::from(disposition), now_secs()),
 	);
+}
+
+/// Clears the upgrade backoff recorded against an event.
+///
+/// The soft-fail marker and this backoff gate the same retry, so operator
+/// recovery has to drop both for the next delivery to evaluate the event
+/// without waiting out the window.
+#[implement(super::Service)]
+pub async fn clear_upgrade_backoff(&self, event_id: &EventId) {
+	self.record_success(Context::Upgrade, event_id)
+		.await;
 }
 
 #[implement(super::Service)]

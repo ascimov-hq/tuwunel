@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use futures::FutureExt;
 use ruma::{
 	CanonicalJsonObject, EventId, MilliSecondsSinceUnixEpoch, RoomId, RoomVersionId, ServerName,
@@ -11,7 +9,7 @@ use tuwunel_core::{
 	matrix::{Event, PduEvent, pdu::RawPduId},
 };
 
-use super::backoff::Context;
+use super::backoff::{Context, UPGRADE_RETRY};
 
 #[implement(super::Service)]
 #[expect(clippy::too_many_arguments)]
@@ -53,11 +51,7 @@ pub(super) async fn handle_prev_pdu(
 	}
 
 	if self
-		.is_suppressed(
-			Context::Upgrade,
-			prev_id,
-			Duration::from_mins(5)..Duration::from_hours(24),
-		)
+		.is_suppressed(Context::Upgrade, prev_id, UPGRADE_RETRY)
 		.await
 		.is_deny()
 	{

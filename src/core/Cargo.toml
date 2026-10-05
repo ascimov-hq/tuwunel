@@ -37,10 +37,10 @@ jemalloc_stats = [
 ]
 perf_measurements = []
 release_max_log_level = [
-	"tracing/max_level_trace",
-	"tracing/release_max_level_info",
 	"log/max_level_trace",
 	"log/release_max_level_info",
+	"tracing/max_level_trace",
+	"tracing/release_max_level_info",
 ]
 sentry_telemetry = []
 tuwunel_mods = [
@@ -109,6 +109,12 @@ tracing-core.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+# tokio hard-errors on this feature without the cfg, so it tracks the same gate
+# as the code reading the histogram.
+[target.'cfg(tokio_unstable)'.dependencies.tokio]
+features = ["schedule-latency"]
+workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true

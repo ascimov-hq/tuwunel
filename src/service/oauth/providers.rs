@@ -154,6 +154,11 @@ async fn configure(&self, mut provider: Provider) -> Result<Provider> {
 			});
 	}
 
+	// MAS rejects `profile`; its userinfo returns only `sub` and `username`.
+	if provider.scope.is_empty() && provider.brand == "mas" {
+		provider.scope = ["openid".to_owned()].into();
+	}
+
 	let response = self
 		.discover(&provider)
 		.await
@@ -323,7 +328,7 @@ fn make_url(provider: &Provider, path: &str) -> Result<Url> {
 		Ok(issuer.join(suffix.as_str())?)
 	} else {
 		let mut url = issuer.to_owned();
-		url.set_path((issuer_path.to_owned() + "/").as_str());
+		url.set_path(&format!("{issuer_path}/"));
 		Ok(url.join(&suffix)?)
 	}
 }

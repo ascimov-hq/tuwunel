@@ -6,8 +6,9 @@ use reqwest::{Client, Method, Request, Response, Url};
 use ruma::{
 	ServerName,
 	api::{
-		EndpointError, IncomingResponse, MatrixVersion, OutgoingRequest, SupportedVersions,
-		error::Error as RumaError,
+		EndpointError, IncomingResponse, MatrixVersion, OutgoingRequest, OutgoingRequestExt,
+		SupportedVersions,
+		error::{Error as RumaError, ErrorBody},
 	},
 };
 use tokio::time::timeout;
@@ -102,7 +103,7 @@ where
 		.await;
 
 	match &result {
-		| Ok(_) => self.record_success(dest),
+		| Ok(_) => self.record_success(dest).await,
 		| Err(error) =>
 			if let Some(class) = classify_error(error) {
 				self.record_failure(dest, class);
@@ -176,8 +177,9 @@ where
 	let limit = self.services.server.config.max_response_size;
 
 	match client.execute(request).await {
-		| Ok(response) =>
-			handle_response::<T>(actual, dest, &method, &url, response, limit).await,
+		| Ok(response) => handle_response::<T>(actual, dest, &method, &url, response, limit)
+			.await
+			.inspect_err(|error| self.evict_misrouted(dest, actual, error)),
 		| Err(error) => Err(self
 			.handle_error(dest, actual, &method, &url, error)
 			.expect_err("always returns error")),
@@ -302,10 +304,33 @@ fn handle_error(
 		debug_error!("{e:?}");
 	}
 
-	self.services.resolver.cache.del_destination(dest);
-	self.services.resolver.cache.del_override(dest);
+	self.evict_route(dest, actual);
 
 	Err(e.into())
+}
+
+// A non-JSON federation response means a proxy or CDN answered, not the
+// homeserver, so the cached route is stale; evict it as transport errors do.
+#[implement(super::Service)]
+fn evict_misrouted(&self, dest: &ServerName, actual: &ActualDest, error: &Error) {
+	let Error::Federation(_, response) = error else {
+		return;
+	};
+
+	if matches!(response.body, ErrorBody::NotJson { .. }) {
+		self.evict_route(dest, actual);
+	}
+}
+
+// Overrides are keyed by the resolved (delegated/SRV) hostname, so evict under
+// the key resolution wrote (`actual.dest.hostname()`), not the origin name.
+#[implement(super::Service)]
+fn evict_route(&self, dest: &ServerName, actual: &ActualDest) {
+	self.services.resolver.cache.del_destination(dest);
+	self.services
+		.resolver
+		.cache
+		.del_override(&actual.dest.hostname());
 }
 
 #[implement(super::Service)]

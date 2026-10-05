@@ -8,7 +8,7 @@ use tuwunel_core::{
 };
 use tuwunel_database::{Deserialized, Json, Map};
 
-use super::Presence;
+use crate::presence::Presence;
 
 pub(crate) struct Data {
 	presenceid_presence: Arc<Map>,
@@ -36,9 +36,11 @@ impl Data {
 
 		let key = presenceid_key(count, user_id);
 		let bytes = self.presenceid_presence.get(&key).await?;
-		let event = Presence::from_json_bytes(&bytes)?
-			.to_presence_event(user_id, &self.services.users)
-			.await;
+		let event = self
+			.services
+			.presence
+			.from_json_bytes_to_event(&bytes, user_id)
+			.await?;
 
 		Ok((count, event))
 	}
@@ -119,12 +121,12 @@ impl Data {
 			status_msg
 		};
 
-		let presence = Presence::new(
-			presence_state.to_owned(),
-			currently_active.unwrap_or(false),
+		let presence = Presence {
+			state: presence_state.to_owned(),
+			currently_active: currently_active.unwrap_or(false),
 			last_active_ts,
 			status_msg,
-		);
+		};
 
 		let count = self.services.globals.next_count();
 		let key = presenceid_key(*count, user_id);
@@ -163,14 +165,20 @@ impl Data {
 		since: u64,
 		to: Option<u64>,
 	) -> impl Stream<Item = (&UserId, u64, &[u8])> + Send + '_ {
+		// Keys are `count.to_be_bytes() ++ user_id` (see `presenceid_key`), so
+		// key order is count order: seek to the first count after `since` and
+		// stop past `to` instead of scanning the whole table on every sync.
+		let from = since.saturating_add(1).to_be_bytes();
+
 		self.presenceid_presence
-			.raw_stream()
+			.raw_stream_from(&from)
 			.ignore_err()
-			.ready_filter_map(move |(key, presence)| {
+			.ready_filter_map(|(key, presence)| {
 				let (count, user_id) = presenceid_parse(key).ok()?;
-				(count > since && to.is_none_or(|to| count <= to))
-					.then_some((user_id, count, presence))
+				Some((user_id, count, presence))
 			})
+			.ready_take_while(move |&(_, count, _)| to.is_none_or(|to| count <= to))
+			.ready_filter(move |&(_, count, _)| count > since)
 	}
 }
 

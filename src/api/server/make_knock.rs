@@ -1,16 +1,18 @@
-use RoomVersionId::*;
 use axum::extract::State;
 use futures::TryFutureExt;
 use ruma::{
-	RoomVersionId,
 	api::{
 		error::{ErrorKind, IncompatibleRoomVersionErrorData},
 		federation::membership::prepare_knock_event,
 	},
 	events::room::member::{MembershipState, RoomMemberEventContent},
 };
-use tuwunel_core::{Err, Error, Result, at, debug_warn, matrix::pdu::PduBuilder};
+use tuwunel_core::{
+	Err, Error, Result, at, debug_warn,
+	matrix::{pdu::PduBuilder, room_version},
+};
 
+use super::utils::require_known_room;
 use crate::Ruma;
 
 /// # `GET /_matrix/federation/v1/make_knock/{roomId}/{userId}`
@@ -20,19 +22,11 @@ pub(crate) async fn create_knock_event_template_route(
 	State(services): State<crate::State>,
 	body: Ruma<prepare_knock_event::v1::Request>,
 ) -> Result<prepare_knock_event::v1::Response> {
-	if !services.metadata.exists(&body.room_id).await {
-		return Err!(Request(NotFound("Room is unknown to this server.")));
-	}
+	require_known_room(&services, &body.room_id, body.origin()).await?;
 
 	if body.user_id.server_name() != body.origin() {
 		return Err!(Request(BadJson("Not allowed to knock on behalf of another server/user.")));
 	}
-
-	// ACL check origin server
-	services
-		.event_handler
-		.acl_check(body.origin(), &body.room_id)
-		.await?;
 
 	if let Some(server) = body.room_id.server_name()
 		&& services
@@ -42,26 +36,28 @@ pub(crate) async fn create_knock_event_template_route(
 		return Err!(Request(Forbidden("Server is banned on this homeserver.")));
 	}
 
-	let room_version = services
+	let room_version_id = services
 		.state
 		.get_room_version(&body.room_id)
 		.await?;
 
-	if matches!(room_version, V1 | V2 | V3 | V4 | V5 | V6) {
+	if !body.ver.contains(&room_version_id) {
 		return Err(Error::BadRequest(
 			ErrorKind::IncompatibleRoomVersion(IncompatibleRoomVersionErrorData::new(
-				room_version.clone(),
+				room_version_id,
 			)),
-			"Room version does not support knocking.",
+			"Your homeserver does not support the features required to knock on this room.",
 		));
 	}
 
-	if !body.ver.contains(&room_version) {
+	let room_version_rules = room_version::rules(&room_version_id)?;
+
+	if !room_version_rules.authorization.knocking {
 		return Err(Error::BadRequest(
 			ErrorKind::IncompatibleRoomVersion(IncompatibleRoomVersionErrorData::new(
-				room_version.clone(),
+				room_version_id,
 			)),
-			"Your homeserver does not support the features required to knock on this room.",
+			"Room version does not support knocking.",
 		));
 	}
 
@@ -99,9 +95,9 @@ pub(crate) async fn create_knock_event_template_route(
 
 	let event = services
 		.federation
-		.format_pdu_into(pdu_json, Some(&room_version))
+		.format_pdu_into(pdu_json, Some(&room_version_id))
 		.await;
 
 	// room v3 and above removed the "event_id" field from remote PDU format
-	Ok(prepare_knock_event::v1::Response { room_version, event })
+	Ok(prepare_knock_event::v1::Response { room_version: room_version_id, event })
 }

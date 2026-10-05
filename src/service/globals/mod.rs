@@ -2,9 +2,12 @@ mod data;
 
 use std::{ops::Range, sync::Arc};
 
-use data::Data;
+pub use data::Data;
 use ruma::{OwnedUserId, RoomAliasId, ServerName, UserId};
-use tuwunel_core::{Result, Server, err, error};
+use tuwunel_core::{
+	Result, Server, err,
+	utils::{Secret, resolve_secret},
+};
 
 use crate::service;
 
@@ -13,25 +16,11 @@ pub struct Service {
 	server: Arc<Server>,
 
 	pub server_user: OwnedUserId,
-	pub turn_secret: Option<String>,
 }
 
 impl crate::Service for Service {
 	fn build(args: &crate::Args<'_>) -> Result<Arc<Self>> {
 		let db = Data::new(args);
-		let config = &args.server.config;
-
-		let turn_secret = config
-			.turn_secret_file
-			.as_ref()
-			.and_then(|path| {
-				std::fs::read_to_string(path)
-					.inspect_err(|e| {
-						error!("Failed to read the TURN secret file: {e}");
-					})
-					.ok()
-			})
-			.or_else(|| config.turn_secret.clone());
 
 		Ok(Arc::new(Self {
 			db,
@@ -41,7 +30,6 @@ impl crate::Service for Service {
 				&args.server.name,
 			)
 			.expect("@conduit:server_name is valid"),
-			turn_secret,
 		}))
 	}
 
@@ -105,6 +93,19 @@ impl Service {
 	#[inline]
 	#[must_use]
 	pub fn is_read_only(&self) -> bool { self.db.db.is_read_only() }
+
+	/// Reads `turn_secret_file` on every call, so a rotated secret takes effect
+	/// without a restart.
+	#[must_use]
+	pub fn turn_secret(&self) -> Option<Secret> {
+		let config = &self.server.config;
+
+		resolve_secret(
+			config.turn_secret_file.as_deref(),
+			config.turn_secret.as_deref(),
+			"TURN secret",
+		)
+	}
 
 	pub fn init_rustls_provider(&self) -> Result {
 		if rustls::crypto::CryptoProvider::get_default().is_none() {

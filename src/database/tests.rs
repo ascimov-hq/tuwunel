@@ -1,19 +1,27 @@
 #![allow(unused_features)] // 1.96.0-nightly 2026-03-07 bug
 #![expect(clippy::needless_borrows_for_generic_args)]
 
-use std::fmt::Debug;
+use std::{env::var, fmt::Debug, process::id as process_id, sync::Arc};
 
+use rocksdb::WriteBatch;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
+use tracing::subscriber::NoSubscriber;
 use tuwunel_core::{
+	Result, Server,
 	arrayvec::ArrayVec,
+	config::{Config, Figment, Sources},
+	log::{LogLevelReloadHandles, Logging, capture::State},
+	metrics::Metrics,
 	ruma::{EventId, RoomId, UserId, serde::Raw},
 };
 
 use crate::{
-	Cbor, Ignore, Interfix,
+	Cbor, Database, Ignore, Interfix,
 	de::from_slice,
 	ser,
 	ser::{Json, serialize_to_vec},
+	txn::next_record,
 };
 
 #[test]
@@ -460,6 +468,36 @@ fn serde_tuple_additive_evolution_option() {
 	assert_eq!(r, room_id);
 	assert_eq!(c, count);
 	assert_eq!(tail, None);
+}
+
+#[test]
+fn serde_tuple_additive_evolution_u64_option() {
+	let count: u64 = 42;
+	let ts: u64 = 1_700_000_000_000;
+
+	// Old rows wrote a bare u64 count; reading as the evolved
+	// (count, Option<ts>) tuple lands the tail at None.
+	let old_bytes = serialize_to_vec(&count).expect("failed to serialize old value");
+
+	let (c, tail): (u64, Option<u64>) =
+		from_slice(&old_bytes).expect("failed to deserialize old value as new type");
+
+	assert_eq!(c, count);
+	assert_eq!(tail, None, "ts tail must default to None for old rows");
+
+	// New rows write (count, ts); the fixed-width tail round-trips as Some
+	// even though its leading big-endian byte is 0x00 (never the 0xFF separator).
+	let new_bytes = serialize_to_vec(&(count, ts)).expect("failed to serialize new value");
+
+	assert_eq!(&new_bytes[..old_bytes.len()], &*old_bytes);
+	assert_eq!(new_bytes[old_bytes.len()], 0xFF, "separator precedes the ts tail");
+	assert_eq!(new_bytes.len(), old_bytes.len() + 1 + size_of::<u64>());
+
+	let (c, tail): (u64, Option<u64>) =
+		from_slice(&new_bytes).expect("failed to deserialize new value");
+
+	assert_eq!(c, count);
+	assert_eq!(tail, Some(ts));
 }
 
 #[test]
@@ -1025,4 +1063,201 @@ fn serde_tuple_string_integer_string() {
 		from_slice(&s).expect("failed to deserialize (integer,string) tuple");
 
 	assert_eq!(c, b, "deserialized (string,integer,string) tuple did not match");
+}
+
+#[test]
+fn lazy_media_outlives_url_preview() {
+	use crate::maps::MAPS;
+
+	let ttl = |name: &str| {
+		MAPS.iter()
+			.find(|desc| desc.name == name)
+			.map(|desc| desc.ttl)
+			.expect("descriptor present")
+	};
+
+	assert!(
+		ttl("mediaid_lazy") >= ttl("url_preview"),
+		"a served preview's mxc must still resolve while the preview is cached"
+	);
+}
+
+#[test]
+fn txn_record_golden() {
+	let mut batch = WriteBatch::default();
+	batch.put(b"key", b"value");
+	batch.delete(b"deleted");
+	batch.put(b"empty", b"");
+
+	let data = batch.data();
+	let mut records = data
+		.get(12..)
+		.expect("batch shorter than its header");
+
+	assert_eq!(next_record(&mut records), Some((0, b"key".as_slice())));
+	assert_eq!(next_record(&mut records), Some((0, b"deleted".as_slice())));
+	assert_eq!(next_record(&mut records), Some((0, b"empty".as_slice())));
+	assert!(records.is_empty());
+}
+
+#[test]
+fn txn_record_golden_long_key() {
+	let long = [0xAA_u8; 300];
+
+	let mut batch = WriteBatch::default();
+	batch.put(long.as_slice(), b"");
+
+	let data = batch.data();
+	let mut records = data
+		.get(12..)
+		.expect("batch shorter than its header");
+
+	assert_eq!(next_record(&mut records), Some((0, long.as_slice())));
+	assert!(records.is_empty());
+}
+
+#[test]
+fn txn_record_cf() {
+	// kTypeColumnFamilyValue cf=200 "k"="v", then kTypeColumnFamilyDeletion cf=9
+	// "del"
+	let mut records: &[u8] =
+		&[0x5, 0xC8, 0x1, 0x1, b'k', 0x1, b'v', 0x4, 0x9, 0x3, b'd', b'e', b'l'];
+
+	assert_eq!(next_record(&mut records), Some((200, b"k".as_slice())));
+	assert_eq!(next_record(&mut records), Some((9, b"del".as_slice())));
+	assert!(records.is_empty());
+}
+
+#[test]
+fn txn_record_unrecognized() {
+	let mut records: &[u8] = &[0x2, 0x1, b'k', 0x1, b'v'];
+
+	assert_eq!(next_record(&mut records), None);
+}
+
+#[test]
+fn txn_record_truncated() {
+	let mut records: &[u8] = &[0x1, 0x5, b'k'];
+
+	assert_eq!(next_record(&mut records), None);
+}
+
+#[tokio::test]
+async fn txn_insert_raw_preserves_bytes() -> Result {
+	let root = var("TMPDIR").unwrap_or_else(|_| "/nvme/target/tmp".into());
+
+	let path = format!("{root}/tuwunel-database-txn-{}", process_id());
+	let raw_config = Figment::new()
+		.merge(("server_name", "localhost"))
+		.merge(("database_path", &path))
+		.merge(("test", ["fresh", "cleanup"]));
+
+	let config = Config::new(&raw_config)?;
+	let runtime = Handle::current();
+	let logging = Logging {
+		subscriber: Arc::new(NoSubscriber::new()),
+		reload: LogLevelReloadHandles::default(),
+		capture: Arc::new(State::new()),
+	};
+
+	let metrics = Metrics::new(Some(&runtime));
+	let server =
+		Arc::new(Server::new(config, Sources::default(), Some(&runtime), logging, metrics));
+	let database = Database::open(&server).await?;
+
+	let first = database.get("alias_roomid")?;
+	let second = database.get("alias_userid")?;
+	let first_key: &[u8] = b"\0raw\xFF:key";
+	let first_value: &[u8] = b"\xFE\0value";
+	let second_key: &[u8] = b"\xFFother\0key";
+	let second_value: &[u8] = b"value\0\xFD";
+
+	let mut txn = database.txn();
+
+	txn.insert_raw(first, first_key, first_value);
+	txn.insert_raw(second, second_key, second_value);
+
+	let mut keys = txn.keys();
+	let (map, key) = keys.next().expect("first queued key");
+
+	assert!(Arc::ptr_eq(&map, first));
+	assert_eq!(key, first_key);
+
+	let (map, key) = keys.next().expect("second queued key");
+
+	assert!(Arc::ptr_eq(&map, second));
+	assert_eq!(key, second_key);
+	assert!(keys.next().is_none());
+	drop(keys);
+
+	txn.execute();
+
+	assert_eq!(first.get(&first_key).await?.as_ref(), first_value);
+	assert_eq!(second.get(&second_key).await?.as_ref(), second_value);
+
+	let watch = first.watch_raw_prefix(first_key);
+	let mut txn = database.txn();
+
+	txn.del_raw(first, first_key);
+	txn.del_raw(second, second_key);
+	txn.execute();
+
+	watch.await;
+
+	assert!(
+		first
+			.get(&first_key)
+			.await
+			.unwrap_err()
+			.is_not_found()
+	);
+
+	assert!(
+		second
+			.get(&second_key)
+			.await
+			.unwrap_err()
+			.is_not_found()
+	);
+
+	drop(database);
+	drop(server);
+
+	Ok(())
+}
+
+#[tokio::test]
+async fn a_restore_is_not_repeated_on_reopen() -> Result {
+	let root = var("TMPDIR").unwrap_or_else(|_| "/nvme/target/tmp".into());
+
+	let path = format!("{root}/tuwunel-database-restore-{}", process_id());
+	let raw_config = Figment::new()
+		.merge(("server_name", "localhost"))
+		.merge(("database_path", &path))
+		.merge(("database_backup_path", format!("{path}-backups")))
+		.merge(("database_restore_backup", 1))
+		.merge(("test", ["fresh", "cleanup"]));
+
+	let config = Config::new(&raw_config)?;
+	let runtime = Handle::current();
+	let logging = Logging {
+		subscriber: Arc::new(NoSubscriber::new()),
+		reload: LogLevelReloadHandles::default(),
+		capture: Arc::new(State::new()),
+	};
+
+	let metrics = Metrics::new(Some(&runtime));
+	let server =
+		Arc::new(Server::new(config, Sources::default(), Some(&runtime), logging, metrics));
+
+	// No such backup exists, so the open which claims the restore fails; the
+	// reopen declines the claim and succeeds on the very same configuration.
+	Database::open(&server)
+		.await
+		.map(drop)
+		.expect_err("the claimed restore has no backup to find");
+
+	Database::open(&server).await?;
+
+	Ok(())
 }

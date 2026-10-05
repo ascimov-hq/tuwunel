@@ -1,10 +1,6 @@
 use std::collections::HashSet;
 
-use futures::{
-	FutureExt, StreamExt, TryFutureExt,
-	future::{join3, ready},
-	pin_mut,
-};
+use futures::{FutureExt, StreamExt, TryFutureExt, future::ready, pin_mut};
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, OwnedServerName, RoomId, UserId,
 	api::federation,
@@ -16,13 +12,10 @@ use ruma::{
 	serde::Raw,
 };
 use tuwunel_core::{
-	Err, Error, Result, debug_info, debug_warn, err, implement,
+	Err, Error, Result, async_noinline, debug_info, debug_warn, err, implement,
 	matrix::{PduCount, pdu::check_rules, room_version},
 	pdu::PduBuilder,
-	utils::{
-		self, FutureBoolExt,
-		future::{ReadyBoolExt, TryExtExt},
-	},
+	utils::{self, FutureBoolExt, future::ReadyBoolExt},
 	warn,
 };
 
@@ -30,24 +23,26 @@ use super::Service;
 use crate::rooms::timeline::RoomMutexGuard;
 
 #[implement(Service)]
+#[async_noinline]
 #[tracing::instrument(
+    name = "leave",
     level = "debug",
     skip_all,
     fields(%room_id, %user_id)
 )]
-pub async fn leave(
-	&self,
-	user_id: &UserId,
-	room_id: &RoomId,
+pub async fn leave<'a>(
+	&'a self,
+	user_id: &'a UserId,
+	room_id: &'a RoomId,
 	reason: Option<String>,
 	remote_leave_now: bool,
-	state_lock: &RoomMutexGuard,
+	state_lock: &'a RoomMutexGuard,
 ) -> Result {
 	let leave_content = RoomMemberEventContent {
 		membership: MembershipState::Leave,
 		reason: reason.clone(),
 		join_authorized_via_users_server: None,
-		is_direct: None,
+		is_direct: false,
 		avatar_url: None,
 		displayname: None,
 		third_party_invite: None,
@@ -181,7 +176,7 @@ async fn leave_locally(
 				membership: MembershipState::Leave,
 				reason,
 				join_authorized_via_users_server: None,
-				is_direct: None,
+				is_direct: false,
 				..event
 			}),
 			user_id,
@@ -300,11 +295,8 @@ async fn remote_leave(
 							.filter_map(|event| event.get_field("sender").ok().flatten())
 							.filter_map(|sender: &str| UserId::parse(sender).ok())
 							.filter_map(|sender| {
-								if !self.services.globals.user_is_local(&sender) {
-									Some(sender.server_name().to_owned())
-								} else {
-									None
-								}
+								(!self.services.globals.user_is_local(&sender))
+									.then(|| sender.server_name().to_owned())
 							}),
 					);
 				},
@@ -369,24 +361,17 @@ async fn remote_leave(
 			)))
 		})?;
 
-	let displayname = self.services.users.displayname(user_id).ok();
+	let mut content = RoomMemberEventContent {
+		reason,
+		..RoomMemberEventContent::new(MembershipState::Leave)
+	};
 
-	let avatar_url = self.services.users.avatar_url(user_id).ok();
+	self.services
+		.profile
+		.fill_profile_data(user_id, &mut content)
+		.await;
 
-	let blurhash = self.services.users.blurhash(user_id).ok();
-
-	let (displayname, avatar_url, blurhash) = join3(displayname, avatar_url, blurhash).await;
-
-	event.insert(
-		"content".into(),
-		to_canonical_value(RoomMemberEventContent {
-			displayname,
-			avatar_url,
-			blurhash,
-			reason,
-			..RoomMemberEventContent::new(MembershipState::Leave)
-		})?,
-	);
+	event.insert("content".into(), to_canonical_value(content)?);
 
 	event.insert(
 		"origin".into(),

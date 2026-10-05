@@ -5,9 +5,15 @@
 //! inclusion of dependencies and nulls out results using the existing interface
 //! when not featured.
 
-use std::{cmp, num::Saturating as Sat, sync::Arc, time::Duration};
+#[cfg(feature = "media_thumbnail")]
+use std::io::Cursor;
+use std::{cmp::min, num::Saturating as Sat, sync::Arc, time::Duration};
 
 use futures::{StreamExt, pin_mut};
+#[cfg(feature = "media_thumbnail")]
+use image::{DynamicImage, ImageFormat, ImageReader, Limits, imageops::FilterType};
+#[cfg(feature = "media_thumbnail")]
+use ruma::http_headers::ContentDispositionType;
 use ruma::{Mxc, UInt, UserId, http_headers::ContentDisposition, media::Method};
 use tokio::sync::Notify;
 use tuwunel_core::{
@@ -16,6 +22,19 @@ use tuwunel_core::{
 };
 
 use super::{Media, data::Metadata};
+
+/// Content type of every thumbnail tuwunel generates.
+#[cfg(feature = "media_thumbnail")]
+const PNG: &str = "image/png";
+
+/// Bytes the decoder is budgeted per pixel of the picture it is asked for.
+#[cfg(feature = "media_thumbnail")]
+const BYTES_PER_PIXEL: u64 = 4;
+
+/// Filename a generated thumbnail is disposed under, per the media repository
+/// specification, rather than the name of the file it was generated from.
+#[cfg(feature = "media_thumbnail")]
+const THUMBNAIL_NAME: &str = "thumbnail.png";
 
 /// Dimension specification for a thumbnail.
 #[derive(Debug)]
@@ -160,10 +179,22 @@ impl super::Service {
 			return self.get_thumbnail_saved(metadata).await;
 		}
 
-		let metadata = self
+		// the original may be lazy preview media promoted on this very request;
+		// only an image is worth serving in a thumbnail's place
+		let Ok(metadata) = self
 			.db
 			.search_file_metadata(mxc, &Dim::default())
-			.await?;
+			.await
+		else {
+			let media = self.get_stored(mxc).await?;
+
+			return media
+				.content_type
+				.as_deref()
+				.is_some_and(|content_type| content_type.starts_with("image/"))
+				.then_some(media)
+				.ok_or_else(|| err!(Request(NotFound("Media not found."))));
+		};
 
 		self.get_thumbnail_generate(mxc, &dim, metadata)
 			.await
@@ -208,21 +239,54 @@ async fn get_thumbnail_generate(
 		return Err!("Could not find original media.");
 	};
 
-	let Ok(image) = image::load_from_memory(&media.content) else {
+	let frame = self.video_frame(mxc, dim, &media).await;
+	let from_video = frame.is_some();
+
+	let Ok(image) = self.decode(frame.as_deref().unwrap_or(&media.content)) else {
+		// a frame the thumbnailer refuses is this video's verdict too; without
+		// it the program would run again on the next request for any size
+		if from_video {
+			self.remember_failure(mxc);
+		}
+
 		// Couldn't parse file to generate thumbnail, send original
 		return Ok(into_media(data, media.content));
 	};
 
-	if dim.width > image.width() || dim.height > image.height() {
+	drop(frame);
+
+	// a video is never servable in place of its own thumbnail, so its frame is
+	// re-encoded however small it is
+	let source = Dim::new(image.width(), image.height(), None);
+	if !from_video && dim.is_passthrough(&source)? {
 		return Ok(into_media(data, media.content));
 	}
 
+	// nothing below reads the original, which on the video path is the whole
+	// staged file, and the encode and the store must not hold it
+	drop(media);
+
 	let mut thumbnail_bytes = Vec::new();
 	let thumbnail = thumbnail_generate(&image, dim)?;
-	let mut cursor = std::io::Cursor::new(&mut thumbnail_bytes);
+	let mut cursor = Cursor::new(&mut thumbnail_bytes);
+
 	thumbnail
-		.write_to(&mut cursor, image::ImageFormat::Png)
+		.write_to(&mut cursor, ImageFormat::Png)
 		.map_err(|error| err!(error!(?error, "Error writing PNG thumbnail.")))?;
+
+	// a generated thumbnail is a PNG rather than the uploaded file, and carries
+	// the name the media repository specification asks of one whether or not the
+	// original arrived with a name of its own
+	let content_disposition = ContentDisposition {
+		disposition_type: ContentDispositionType::Inline,
+		filename: Some(THUMBNAIL_NAME.to_owned()),
+	};
+
+	let data = Metadata {
+		content_type: Some(PNG.to_owned()),
+		content_disposition: Some(content_disposition),
+		..data
+	};
 
 	// Save thumbnail in database so we don't have to generate it again next time
 	let thumbnail_key = self.db.create_file_metadata(
@@ -251,13 +315,44 @@ async fn get_thumbnail_generate(
 	self.get_thumbnail_saved(data).await
 }
 
+/// Decode a picture whose header declares no more than the configured pixel
+/// count. The dimensions are checked before any decoder allocates, since
+/// `Limits` enforces only a byte budget and leaves a decoder free to ignore it.
 #[cfg(feature = "media_thumbnail")]
-fn thumbnail_generate(
-	image: &image::DynamicImage,
-	requested: &Dim,
-) -> Result<image::DynamicImage> {
-	use image::imageops::FilterType;
+#[implement(super::Service)]
+#[tracing::instrument(name = "decode", level = "trace", skip_all)]
+fn decode(&self, bytes: &[u8]) -> Result<DynamicImage> {
+	let budget = self.services.config.media_thumbnail_max_pixels;
+	let (width, height) = reader(bytes)?
+		.into_dimensions()
+		.map_err(|error| err!(debug_warn!(?error, "Failed to read picture dimensions.")))?;
 
+	let pixels = u64::from(width).saturating_mul(u64::from(height));
+
+	if pixels > budget {
+		return Err!(debug_warn!(%width, %height, "Picture is past the {budget} pixel budget."));
+	}
+
+	let mut limits = Limits::no_limits();
+	limits.max_alloc = Some(budget.saturating_mul(BYTES_PER_PIXEL));
+
+	let mut reader = reader(bytes)?;
+	reader.limits(limits);
+
+	reader
+		.decode()
+		.map_err(|error| err!(debug_warn!(?error, "Failed to decode picture.")))
+}
+
+#[cfg(feature = "media_thumbnail")]
+fn reader(bytes: &[u8]) -> Result<ImageReader<Cursor<&[u8]>>> {
+	ImageReader::new(Cursor::new(bytes))
+		.with_guessed_format()
+		.map_err(Into::into)
+}
+
+#[cfg(feature = "media_thumbnail")]
+pub(super) fn thumbnail_generate(image: &DynamicImage, requested: &Dim) -> Result<DynamicImage> {
 	let thumbnail = if !requested.crop() {
 		let Dim { width, height, .. } = requested.scaled(&Dim {
 			width: image.width(),
@@ -266,7 +361,12 @@ fn thumbnail_generate(
 		})?;
 		image.thumbnail_exact(width, height)
 	} else {
-		image.resize_to_fill(requested.width, requested.height, FilterType::CatmullRom)
+		// upscaling is forbidden outright, and resize_to_fill enlarges a source
+		// smaller than the request to meet it
+		let width = min(requested.width, image.width());
+		let height = min(requested.height, image.height());
+
+		image.resize_to_fill(width, height, FilterType::CatmullRom)
 	};
 
 	Ok(thumbnail)
@@ -308,8 +408,8 @@ impl Dim {
 		let image_width = image.width;
 		let image_height = image.height;
 
-		let width = cmp::min(self.width, image_width);
-		let height = cmp::min(self.height, image_height);
+		let width = min(self.width, image_width);
+		let height = min(self.height, image_height);
 
 		let use_width = Sat(width) * Sat(image_height) < Sat(height) * Sat(image_width);
 
@@ -332,6 +432,24 @@ impl Dim {
 			height: y,
 			method: Method::Scale,
 		})
+	}
+
+	/// Returns true when generation cannot improve on the source and the
+	/// original should be served instead: either the request would upscale, or
+	/// the generated thumbnail would carry the source's own dimensions.
+	pub fn is_passthrough(&self, source: &Self) -> Result<bool> {
+		if self.width > source.width || self.height > source.height {
+			return Ok(true);
+		}
+
+		let (width, height) = if self.crop() {
+			(self.width, self.height)
+		} else {
+			let scaled = self.scaled(source)?;
+			(scaled.width, scaled.height)
+		};
+
+		Ok(width == source.width && height == source.height)
 	}
 
 	/// Returns width, height of the thumbnail and whether it should be cropped.

@@ -78,6 +78,9 @@ commands. Run any command with `--help` for argument detail.
   local sender even when the user is offline or unwilling.
 - `!admin users force-demote <user> <room>`: drops a user's power level to
   the room default when permissions allow.
+- `!admin users set-profile-key <user> <key> <value>`: sets a single profile
+  key (e.g. `displayname`, `avatar_url`, `m.tz`, or a custom key) on a local
+  user, for example to remove an abusive display name.
 - `!admin users delete-room-tag` / `put-room-tag`: room-tag housekeeping;
   the `m.server_notice` tag pinned to the admin room is the typical use.
 
@@ -163,16 +166,29 @@ Operator-relevant implications when enabling:
   and the event is sent or accepted unsigned, on the assumption that the
   next homeserver in the room will pick up the gap.
 - **Fail-closed on explicit refusal.** A policy server returning
-  `M_FORBIDDEN` (or, on the unstable variant, `200 OK` with no signature for
-  the configured `via`) causes outbound sends to fail with `M_FORBIDDEN`,
+  `400 M_FORBIDDEN` (or, on the unstable variant, `200 OK` with no signature
+  for the configured `via`) causes outbound sends to fail with `M_FORBIDDEN`,
   and inbound events to soft-fail.
+- **Inbound soft-fails withhold the event, and are reversible.** A soft-failed
+  event is kept out of the room timeline and is never relayed to clients, but
+  it stays stored, still answers federation requests for it, and still carries
+  the state that descendant events resolve against. The verdict is re-checked
+  whenever federation supplies the event again, on a schedule that widens from
+  five minutes to a day. An explicit refusal is itself cached for 24 hours, so
+  re-checks inside that window answer from the cache and the policy server is
+  only asked again once it lapses; `!admin rooms clear-soft-failed-events
+  <room>` drops the stored verdicts for one room to force the question
+  immediately.
+- **Soft-failed events do not move the room forward.** They are not added to
+  the room's forward extremities and do not resolve into current state, so a
+  refused membership or power-level change cannot take effect locally.
 - **Privacy in encrypted rooms.** The PDU is forwarded to the policy server
   for signing. Ciphertext is opaque, but metadata (sender, timestamp, room,
   event type) is not. Encrypted-room policy delegation is the room's call;
   Tuwunel does not block it.
-- **Refusal and rate-limit caching.** Per-event refusals and per-policy-server
-  `M_LIMIT_EXCEEDED` backoffs are persisted, so repeated arrivals of the
-  same event do not re-hit a refusing or throttled server.
+- **Refusal and rate-limit caching.** Per-event refusals and
+  `M_LIMIT_EXCEEDED` backoffs are persisted, so repeated arrivals of the same
+  event do not re-hit a refusing or throttled server.
 
 For room version compatibility, MSC4416 (the room-version-13 successor that
 makes a missing or invalid policy signature an auth-rule rejection rather

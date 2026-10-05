@@ -1,8 +1,19 @@
-pub use nix::sys::resource::Usage;
 #[cfg(unix)]
-use nix::sys::resource::{UsageWho, getrusage};
+use nix::sys::resource::{Usage as NixUsage, UsageWho, getrusage};
 
 use crate::{Result, expected};
+
+/// Platform representation of process resource usage.
+///
+/// On Unix this aliases nix's `Usage`, populated by `getrusage()`. Platforms
+/// without `getrusage()` use a zero-field `Debug` stub so tracing fields such
+/// as `?resource_usage` remain portable.
+#[cfg(unix)]
+pub type Usage = NixUsage;
+
+#[cfg(not(unix))]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Usage;
 
 pub fn virt() -> Result<usize> {
 	Ok(statm_bytes()?
@@ -74,8 +85,13 @@ pub fn statm() -> Result<impl Iterator<Item = usize>> { Ok([0, 0, 0, 0, 0, 0].in
 pub fn usage() -> Result<Usage> { getrusage(UsageWho::RUSAGE_SELF).map_err(Into::into) }
 
 #[cfg(not(unix))]
-pub fn usage() -> Result<Usage> { Ok(Usage::default()) }
+pub fn usage() -> Result<Usage> { Ok(Usage) }
 
+/// Returns resource usage for the current thread when the platform supports it.
+///
+/// Linux, FreeBSD, and OpenBSD report thread-specific usage. Other Unix
+/// platforms fall back to process-wide usage. Platforms without `getrusage()`
+/// return the zero-field [`Usage`] stub.
 #[cfg(any(
 	target_os = "linux",
 	target_os = "freebsd",
@@ -83,11 +99,15 @@ pub fn usage() -> Result<Usage> { Ok(Usage::default()) }
 ))]
 pub fn thread_usage() -> Result<Usage> { getrusage(UsageWho::RUSAGE_THREAD).map_err(Into::into) }
 
-#[cfg(not(any(
-	target_os = "linux",
-	target_os = "freebsd",
-	target_os = "openbsd"
-)))]
-pub fn thread_usage() -> Result<Usage> {
-	unimplemented!("RUSAGE_THREAD available on this platform")
-}
+#[cfg(all(
+	unix,
+	not(any(
+		target_os = "linux",
+		target_os = "freebsd",
+		target_os = "openbsd"
+	))
+))]
+pub fn thread_usage() -> Result<Usage> { getrusage(UsageWho::RUSAGE_SELF).map_err(Into::into) }
+
+#[cfg(not(unix))]
+pub fn thread_usage() -> Result<Usage> { Ok(Usage) }

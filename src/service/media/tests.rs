@@ -1,5 +1,292 @@
 #![cfg(test)]
 
+use ruma::media::Method;
+
+use super::Dim;
+
+fn scale(width: u32, height: u32) -> Dim { Dim::new(width, height, Some(Method::Scale)) }
+fn crop(width: u32, height: u32) -> Dim { Dim::new(width, height, Some(Method::Crop)) }
+fn source(width: u32, height: u32) -> Dim { Dim::new(width, height, None) }
+
+/// The source already carries the requested dimensions, so scaling is a no-op
+/// and re-encoding would only discard the original's format and metadata.
+#[test]
+fn passthrough_when_scale_request_matches_source() {
+	assert!(
+		scale(800, 600)
+			.is_passthrough(&source(800, 600))
+			.unwrap()
+	);
+}
+
+/// `scaled` covers the requested box rather than fitting inside it, so a source
+/// already meeting the requested height cannot shrink: the generated thumbnail
+/// would be the source itself.
+#[test]
+fn passthrough_when_one_side_already_meets_request() {
+	assert!(
+		scale(800, 600)
+			.is_passthrough(&source(1000, 600))
+			.unwrap()
+	);
+}
+
+/// A genuinely larger source must still be thumbnailed.
+#[test]
+fn generates_when_source_is_larger_in_both_dimensions() {
+	assert!(
+		!scale(800, 600)
+			.is_passthrough(&source(4000, 3000))
+			.unwrap()
+	);
+}
+
+/// Crop reaches the requested size by cropping, so a source that is larger in
+/// only one dimension must still be generated. Widening the upscale guard to
+/// `>=` would wrongly pass this through.
+#[test]
+fn generates_when_crop_source_is_larger_in_one_dimension() {
+	assert!(
+		!crop(96, 96)
+			.is_passthrough(&source(500, 96))
+			.unwrap()
+	);
+}
+
+/// Servers must not upscale; a source smaller than the request is served as-is.
+#[test]
+fn passthrough_when_request_exceeds_source() {
+	assert!(
+		crop(96, 96)
+			.is_passthrough(&source(50, 50))
+			.unwrap()
+	);
+	assert!(
+		scale(800, 600)
+			.is_passthrough(&source(1000, 400))
+			.unwrap()
+	);
+}
+
+/// Crop at exactly the source size reproduces the source.
+#[test]
+fn passthrough_when_crop_request_matches_source() {
+	assert!(
+		crop(96, 96)
+			.is_passthrough(&source(96, 96))
+			.unwrap()
+	);
+}
+
+#[cfg(feature = "media_thumbnail")]
+mod generate {
+	use image::{DynamicImage, RgbImage};
+
+	use super::{super::thumbnail::thumbnail_generate, crop, scale};
+
+	fn blank(width: u32, height: u32) -> DynamicImage {
+		DynamicImage::ImageRgb8(RgbImage::new(width, height))
+	}
+
+	/// Servers must not upscale under any circumstance. A video's frame reaches
+	/// generation without the passthrough guard that spares an image, so the
+	/// crop path has to refuse to enlarge on its own.
+	#[test]
+	fn crop_never_upscales() {
+		let thumbnail = thumbnail_generate(&blank(50, 50), &crop(96, 96)).unwrap();
+
+		assert_eq!((thumbnail.width(), thumbnail.height()), (50, 50));
+	}
+
+	/// A source larger in one dimension only still must not grow in the other.
+	#[test]
+	fn crop_never_upscales_one_dimension() {
+		let thumbnail = thumbnail_generate(&blank(500, 50), &crop(96, 96)).unwrap();
+
+		assert_eq!((thumbnail.width(), thumbnail.height()), (96, 50));
+	}
+
+	/// A crop request inside the source is still honoured exactly.
+	#[test]
+	fn crop_within_the_source_is_exact() {
+		let thumbnail = thumbnail_generate(&blank(500, 300), &crop(96, 96)).unwrap();
+
+		assert_eq!((thumbnail.width(), thumbnail.height()), (96, 96));
+	}
+
+	/// The scale path clamps through `Dim::scaled`; pin it so the two branches
+	/// cannot drift apart.
+	#[test]
+	fn scale_never_upscales() {
+		let thumbnail = thumbnail_generate(&blank(50, 40), &scale(800, 600)).unwrap();
+
+		assert!(thumbnail.width() <= 50 && thumbnail.height() <= 40);
+	}
+}
+
+#[cfg(feature = "media_thumbnail")]
+mod video {
+	use std::{borrow::Cow, path::Path};
+
+	use super::super::video::substitute;
+
+	/// The staged path and the requested size reach the program only through
+	/// token substitution, and a token may appear more than once in one
+	/// argument.
+	#[test]
+	fn substitutes_every_token_in_an_argument() {
+		let path = Path::new("/tmp/tuwunel-video-Ahk3");
+		let arg = substitute("{input}:{width}x{height}:{width}", path, "320", "240");
+
+		assert_eq!(arg, "/tmp/tuwunel-video-Ahk3:320x240:320");
+	}
+
+	/// An argument carrying no token is the program's own flag, and must reach
+	/// it byte for byte without being copied to do so.
+	#[test]
+	fn borrows_an_argument_without_a_token() {
+		let path = Path::new("/tmp/tuwunel-video-Ahk3");
+		let arg = substitute("-frames:v", path, "320", "240");
+
+		assert_eq!(arg, "-frames:v");
+		assert!(matches!(arg, Cow::Borrowed(_)), "an untouched argument was copied");
+	}
+}
+
+#[cfg(all(unix, feature = "media_thumbnail"))]
+mod program {
+	use std::{env::temp_dir, fs::remove_file, time::Duration};
+
+	use tokio::time::{Instant, sleep, timeout};
+	use tuwunel_core::utils::random_string;
+
+	use super::super::video::run;
+
+	const SHELL: &str = "/bin/sh";
+
+	const LIMIT: u64 = 4096;
+
+	/// Every program under test exits at once; the deadline is present only to
+	/// keep a hung one from hanging the suite.
+	fn deadline() -> Instant { after(Duration::from_secs(30)) }
+
+	fn after(duration: Duration) -> Instant {
+		Instant::now()
+			.checked_add(duration)
+			.expect("a deadline within the epoch")
+	}
+
+	/// The frame arrives on standard output, not through a file the program is
+	/// told to write.
+	#[tokio::test]
+	async fn collects_the_frame_from_standard_output() {
+		let args = ["-c", "printf frame"];
+		let frame = run(SHELL, args, LIMIT, deadline())
+			.await
+			.expect("a program writing output produces a frame");
+
+		assert_eq!(frame.as_slice(), b"frame");
+	}
+
+	/// A program can exit zero having decoded nothing, so an empty output is a
+	/// failure rather than a zero-length thumbnail.
+	#[tokio::test]
+	async fn rejects_a_program_that_writes_no_frame() {
+		let args = ["-c", "exit 0"];
+
+		run(SHELL, args, LIMIT, deadline())
+			.await
+			.expect_err("a program writing nothing produces no frame");
+	}
+
+	/// A misconfigured command is diagnosed from the program's own standard
+	/// error, which is the only account of why it failed.
+	#[tokio::test]
+	async fn reports_the_diagnostic_of_a_failing_program() {
+		let args = ["-c", "echo Unknown encoder >&2; exit 1"];
+		let error = run(SHELL, args, LIMIT, deadline())
+			.await
+			.expect_err("a non-zero exit is a failure")
+			.to_string();
+
+		assert!(error.contains("Unknown encoder"), "{error}");
+	}
+
+	/// A program overrunning the deadline is killed along with whatever it
+	/// spawned. The wrapper exits at once and leaves the descendant holding
+	/// the pipe, which is the shape that orphans work: waiting on the direct
+	/// child alone reports the program finished while its decoder runs on.
+	#[tokio::test]
+	async fn kills_the_group_of_a_wrapper_that_exits() {
+		let marker = temp_dir().join(format!("tuwunel-group-{}", random_string(16)));
+		let script = format!("(sleep 1; touch {}) &", marker.display());
+		let args = ["-c", script.as_str()];
+
+		run(SHELL, args, LIMIT, after(Duration::from_millis(200)))
+			.await
+			.expect_err("a program past its deadline fails");
+
+		// outlive the descendant's own delay, so that its absence means it was
+		// killed rather than merely still sleeping
+		sleep(Duration::from_millis(1500)).await;
+
+		let survived = marker.exists();
+		remove_file(&marker).ok();
+
+		assert!(!survived, "a descendant outlived the killed group");
+	}
+
+	/// Shutdown and a disconnected client both drop the request rather than
+	/// expire a deadline, so the group has to die on the dropped future too.
+	#[tokio::test]
+	async fn kills_the_group_of_a_cancelled_program() {
+		let marker = temp_dir().join(format!("tuwunel-cancel-{}", random_string(16)));
+		let script = format!("(sleep 1; touch {}) &", marker.display());
+		let args = ["-c", script.as_str()];
+
+		// boxed so that dropping the binding drops the future itself, which a
+		// stack pin would not
+		let mut running = Box::pin(run(SHELL, args, LIMIT, deadline()));
+
+		timeout(Duration::from_millis(200), &mut running)
+			.await
+			.expect_err("the program should still be running");
+
+		drop(running);
+		sleep(Duration::from_millis(1500)).await;
+
+		let survived = marker.exists();
+		remove_file(&marker).ok();
+
+		assert!(!survived, "a descendant outlived the cancelled request");
+	}
+
+	/// A frame past the limit is refused outright: serving the prefix would
+	/// hand the thumbnailer a truncation to fail on, reporting a decode error
+	/// for what is really an oversized frame.
+	#[tokio::test]
+	async fn refuses_a_frame_past_the_limit() {
+		let args = ["-c", "printf frame"];
+		let error = run(SHELL, args, 3, deadline())
+			.await
+			.expect_err("five bytes is past a three byte limit")
+			.to_string();
+
+		assert!(error.contains("past 3 bytes"), "{error}");
+	}
+
+	/// A frame filling the limit exactly is not mistaken for one past it.
+	#[tokio::test]
+	async fn accepts_a_frame_filling_the_limit() {
+		let args = ["-c", "printf frame"];
+		let frame = run(SHELL, args, 5, deadline())
+			.await
+			.expect("five bytes fits a five byte limit");
+
+		assert_eq!(frame.as_slice(), b"frame");
+	}
+}
+
 #[tokio::test]
 #[cfg(disable)] //TODO: fixme
 async fn long_file_names_works() {

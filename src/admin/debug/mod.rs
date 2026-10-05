@@ -2,6 +2,7 @@ mod change_log_level;
 mod create_jwt;
 mod database_files;
 mod database_stats;
+mod delete_forward_extremities;
 mod dump_pdus;
 mod echo;
 mod event_fetcher;
@@ -22,11 +23,14 @@ mod list_dependencies;
 mod memory_stats;
 mod parse_pdu;
 mod ping;
+mod rebuild_relation_index;
+mod rebuild_thread_index;
 mod resolve_true_destination;
 mod resync_database;
 mod runtime_interval;
 mod runtime_metrics;
 mod sign_json;
+mod state_at_incoming;
 mod task_interval;
 mod task_metrics;
 pub(crate) mod tester;
@@ -210,6 +214,19 @@ pub(super) enum DebugCommand {
 		server_name: OwnedServerName,
 	},
 
+	/// - Prunes the room's forward extremities down to a single one, keeping
+	///   the extremity furthest along in stream order.
+	///
+	/// A room accumulates extra forward extremities when it takes on events
+	/// across a gap or fork it cannot fully resolve; collapsing them repairs a
+	/// room wedged with a large or growing extremity set. This is the
+	/// admin-command counterpart to the Synapse
+	/// `DELETE /_synapse/admin/v1/rooms/{roomId}/forward_extremities` endpoint.
+	DeleteForwardExtremities {
+		/// The room ID or alias
+		room_id: OwnedRoomOrAliasId,
+	},
+
 	/// - Runs a server name through tuwunel's true destination resolution
 	///   process
 	///
@@ -297,6 +314,13 @@ pub(super) enum DebugCommand {
 	/// - Synchronize database with primary (secondary only)
 	ResyncDatabase,
 
+	/// - Rebuild the typed relation index (relatesto_typed) from all PDUs
+	RebuildRelationIndex,
+
+	/// - Rebuild the thread activity index (threadactivityid_rootid) from all
+	///   thread roots
+	RebuildThreadIndex,
+
 	/// - Retrieves the saved original PDU before it has been redacted
 	GetRetainedPdu {
 		event_id: OwnedEventId,
@@ -305,6 +329,13 @@ pub(super) enum DebugCommand {
 	/// - Dump all stored PDUs
 	DumpPdus {
 		dir: String,
+	},
+
+	/// - Run a read-only local state derivation for one stored event and report
+	///   the outcome
+	StateAtIncoming {
+		/// An event ID (a $ followed by the base64 reference hash)
+		event_id: OwnedEventId,
 	},
 
 	/// - Drive the federation event-fetcher service directly (diagnostic)

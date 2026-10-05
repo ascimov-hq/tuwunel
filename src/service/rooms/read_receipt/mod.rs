@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use futures::{Stream, StreamExt};
 use ruma::{
-	OwnedEventId, OwnedUserId, RoomId, UserId,
+	MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, RoomId, UInt, UserId,
 	api::appservice::event::push_events::v1::EphemeralData,
 	events::{
 		AnySyncEphemeralRoomEvent, SyncEphemeralRoomEvent,
@@ -17,7 +17,9 @@ use ruma::{
 	serde::Raw,
 };
 use tuwunel_core::{
-	Result, debug, err,
+	Result, debug,
+	debug::INFO_SPAN_LEVEL,
+	err,
 	matrix::{
 		Event,
 		pdu::{PduCount, PduId, RawPduId},
@@ -25,7 +27,7 @@ use tuwunel_core::{
 	smallstr::SmallString,
 	smallvec::SmallVec,
 	trace,
-	utils::IterStream,
+	utils::{BoolExt, IterStream},
 	warn,
 };
 
@@ -41,6 +43,22 @@ pub type PrivateReadEvents = SmallVec<[Raw<AnySyncEphemeralRoomEvent>; 1]>;
 /// including the leading `$`; 48 bytes inline matches the project's
 /// `StateKey` budget and stays inline for every realistic thread root.
 type ThreadKind = SmallString<[u8; 48]>;
+
+/// A private read marker write for one `(room, user, thread)` context.
+///
+/// `count` is the timeline position the marker addresses and `ts` the receipt
+/// timestamp. `announce` opens the sync gate, carrying the marker to the
+/// user's other devices; a marker the server writes on the user's behalf
+/// leaves it closed.
+#[derive(Clone, Copy, Debug)]
+pub struct PrivateRead<'a> {
+	pub room_id: &'a RoomId,
+	pub user_id: &'a UserId,
+	pub count: u64,
+	pub ts: MilliSecondsSinceUnixEpoch,
+	pub thread: &'a ReceiptThread,
+	pub announce: bool,
+}
 
 pub struct Service {
 	services: Arc<crate::services::OnceServices>,
@@ -59,20 +77,35 @@ impl crate::Service for Service {
 }
 
 impl Service {
-	/// Replaces the previous read receipt.
-	#[tracing::instrument(skip(self), level = "debug", name = "set_receipt")]
+	/// Replaces the previous read receipt when the incoming one advances.
+	///
+	/// Returns whether the receipt was stored. A re-posted marker allocates no
+	/// stream position, so appservice and federation delivery are both skipped.
+	#[tracing::instrument(
+		name = "receipt"
+		level = INFO_SPAN_LEVEL,
+		skip_all,
+		fields(
+			%room_id,
+			%user_id,
+			?event.content
+		)
+	)]
 	pub async fn readreceipt_update(
 		&self,
 		user_id: &UserId,
 		room_id: &RoomId,
 		event: &ReceiptEvent,
-	) {
-		// update local
-		self.db
+	) -> bool {
+		if self
+			.db
 			.readreceipt_update(user_id, room_id, event)
-			.await;
+			.await
+			.is_false()
+		{
+			return false;
+		}
 
-		// update appservices
 		self.services
 			.sending
 			.send_edu_room_appservices(room_id, |buf| {
@@ -86,7 +119,6 @@ impl Service {
 			.await
 			.expect("edu serialization or flush failed");
 
-		// update federation
 		if self.services.globals.user_is_local(user_id) {
 			self.services
 				.sending
@@ -94,6 +126,8 @@ impl Service {
 				.await
 				.expect("room flush failed");
 		}
+
+		true
 	}
 
 	/// Gets every stored private read receipt for `(room, user)`. Returns
@@ -120,20 +154,17 @@ impl Service {
 			.private_read_get_count(room_id, user_id)
 			.await
 			.ok()
-			.map(|count| (ThreadKind::new(), count));
-
-		let threaded: SmallVec<[(ThreadKind, u64); 1]> = self
-			.db
-			.private_read_threaded_stream(room_id, user_id)
-			.collect()
-			.await;
+			.map(|(count, ts)| (ThreadKind::new(), count, ts));
 
 		let events = legacy
 			.into_iter()
-			.chain(threaded)
 			.stream()
-			.filter_map(|(kind, count)| async move {
-				self.build_private_read_event(shortroomid, count, user_id, &kind)
+			.chain(
+				self.db
+					.private_read_threaded_stream(room_id, user_id),
+			)
+			.filter_map(async |(kind, count, ts)| {
+				self.build_private_read_event(shortroomid, count, ts, user_id, &kind)
 					.await
 			})
 			.collect()
@@ -146,6 +177,7 @@ impl Service {
 		&self,
 		shortroomid: u64,
 		count: u64,
+		ts: Option<u64>,
 		user_id: &UserId,
 		thread_kind: &str,
 	) -> Option<Raw<AnySyncEphemeralRoomEvent>> {
@@ -162,13 +194,17 @@ impl Service {
 			.ok()?;
 
 		let thread = thread_kind_to_receipt(thread_kind);
+		let ts = ts
+			.and_then(UInt::new)
+			.map(MilliSecondsSinceUnixEpoch);
+
 		let event_id: OwnedEventId = pdu.event_id().to_owned();
 		let user_id: OwnedUserId = user_id.to_owned();
 		let content: BTreeMap<OwnedEventId, Receipts> = BTreeMap::from_iter([(
 			event_id,
 			BTreeMap::from_iter([(
 				ReceiptType::ReadPrivate,
-				BTreeMap::from_iter([(user_id, Receipt { ts: None, thread })]),
+				BTreeMap::from_iter([(user_id, Receipt { ts, thread })]),
 			)]),
 		)]);
 
@@ -193,19 +229,13 @@ impl Service {
 	}
 
 	/// Sets a private read marker at PDU `count` for the given thread.
+	///
 	/// Unthreaded writes supersede prior per-thread rows so the room-wide
-	/// receipt subsumes thread state.
+	/// receipt subsumes thread state. Returns whether the marker advanced; a
+	/// position at or behind the stored one writes nothing.
 	#[tracing::instrument(skip(self), level = "debug", name = "set_private")]
-	pub async fn private_read_set(
-		&self,
-		room_id: &RoomId,
-		user_id: &UserId,
-		count: u64,
-		thread: &ReceiptThread,
-	) {
-		self.db
-			.private_read_set(room_id, user_id, count, thread)
-			.await;
+	pub async fn private_read_set(&self, private_read: PrivateRead<'_>) -> bool {
+		self.db.private_read_set(private_read).await
 	}
 
 	/// Returns the private read marker PDU count.
@@ -219,7 +249,7 @@ impl Service {
 		&self,
 		room_id: &RoomId,
 		user_id: &UserId,
-	) -> Result<u64> {
+	) -> Result<(u64, Option<u64>)> {
 		self.db
 			.private_read_get_count(room_id, user_id)
 			.await

@@ -93,6 +93,7 @@ where
 			.map(AuthFlow::new)
 			.collect(),
 
+		params: to_raw_value(&json!({})).ok(),
 		..Default::default()
 	};
 

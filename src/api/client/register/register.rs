@@ -5,7 +5,7 @@ use ruma::{
 	MilliSecondsSinceUnixEpoch, OwnedUserId, UserId,
 	api::client::{
 		account::register::{self, LoginType, RegistrationKind},
-		uiaa::{AuthData, AuthFlow, AuthType, EmailIdentity, ThirdpartyIdCredentials, UiaaInfo},
+		uiaa::{AuthFlow, AuthType, ThirdpartyIdCredentials, UiaaInfo},
 	},
 };
 use serde_json::{json, value::to_raw_value};
@@ -64,7 +64,7 @@ pub(crate) async fn register_route(
 
 	check_appservice_namespace(services, &body, &user_id, emergency_mode_enabled).await?;
 
-	enforce_uiaa(services, &body, is_guest).await?;
+	let email_creds = enforce_uiaa(services, &body, is_guest).await?;
 
 	let password = if is_guest { None } else { body.password.as_deref() };
 
@@ -82,7 +82,7 @@ pub(crate) async fn register_route(
 
 	record_accepted_terms(services, &user_id, &body, is_guest).await?;
 
-	bind_registration_email(services, &user_id, &body).await?;
+	bind_registration_email(services, &user_id, email_creds.as_ref()).await?;
 
 	if (!is_guest && body.inhibit_login)
 		|| body
@@ -272,9 +272,9 @@ async fn enforce_uiaa(
 	services: crate::State,
 	body: &Ruma<register::v3::Request>,
 	is_guest: bool,
-) -> Result {
+) -> Result<Option<ThirdpartyIdCredentials>> {
 	if body.appservice_info.is_some() || is_guest {
-		return Ok(());
+		return Ok(None);
 	}
 
 	let token_required = services.registration_tokens.is_enabled().await;
@@ -314,42 +314,44 @@ async fn enforce_uiaa(
 		auth_error: None,
 	};
 
+	let server_user = UserId::parse_with_server_name("", services.globals.server_name())?;
+
 	match &body.auth {
 		| Some(auth) => {
 			let (worked, uiaainfo) = services
 				.uiaa
-				.try_auth(
-					&UserId::parse_with_server_name("", services.globals.server_name())?,
-					"".into(),
-					auth,
-					&uiaainfo,
-				)
+				.try_auth(&server_user, "".into(), auth, &uiaainfo)
 				.await?;
 
 			if !worked {
 				return Err(Error::Uiaa(uiaainfo));
 			}
-			// Success!
+
+			// Recover the validated email creds the session retained, so the bind works
+			// regardless of which stage completed the flow.
+			let creds = email_required
+				.then_some(uiaainfo.session.as_deref())
+				.flatten()
+				.and_then(|session| {
+					services
+						.uiaa
+						.take_uiaa_threepid(&server_user, "".into(), session)
+				});
+
+			Ok(creds)
 		},
 		| _ => match body.json_body {
+			| None => Err!(Request(NotJson("JSON body is not valid"))),
 			| Some(ref json) => {
 				uiaainfo.session = Some(utils::random_string(SESSION_ID_LENGTH));
-				services.uiaa.create(
-					&UserId::parse_with_server_name("", services.globals.server_name())?,
-					"".into(),
-					&uiaainfo,
-					json,
-				);
+				services
+					.uiaa
+					.create(&server_user, "".into(), &uiaainfo, json);
 
-				return Err(Error::Uiaa(uiaainfo));
-			},
-			| _ => {
-				return Err!(Request(NotJson("JSON body is not valid")));
+				Err(Error::Uiaa(uiaainfo))
 			},
 		},
 	}
-
-	Ok(())
 }
 
 async fn record_accepted_terms(
@@ -391,18 +393,17 @@ async fn record_accepted_terms(
 async fn bind_registration_email(
 	services: crate::State,
 	user_id: &UserId,
-	body: &Ruma<register::v3::Request>,
+	creds: Option<&ThirdpartyIdCredentials>,
 ) -> Result {
 	if !services.sendmail.is_enabled() {
 		return Ok(());
 	}
 
-	let Some(AuthData::EmailIdentity(EmailIdentity { thirdparty_id_creds, .. })) = &body.auth
-	else {
+	let Some(creds) = creds else {
 		return Ok(());
 	};
 
-	if let Err(e) = try_bind_registration_email(services, user_id, thirdparty_id_creds).await {
+	if let Err(e) = try_bind_registration_email(services, user_id, creds).await {
 		warn!(%user_id, "Skipping registration email binding: {e}");
 	}
 
@@ -464,9 +465,7 @@ async fn announce_new_user(
 		info!("{notice}");
 	}
 
-	if services.server.config.admin_room_notices {
-		services.admin.notice(&notice).await;
-	}
+	services.admin.notify(&notice).await;
 
 	Ok(())
 }

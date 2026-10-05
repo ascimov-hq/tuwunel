@@ -41,6 +41,40 @@ impl<E: Event> Matches<&E> for RoomEventFilter {
 	}
 }
 
+/// Event-type filtering by name, for data which is not a PDU: ephemeral
+/// events, account data and presence.
+pub trait MatchesType {
+	fn matches_type(&self, kind: &str) -> bool;
+
+	/// False when the filter excludes every event type (`not_types: ["*"]` or
+	/// an empty `types`), so callers can skip loading that data at all.
+	fn matches_any_type(&self) -> bool;
+}
+
+impl MatchesType for RoomEventFilter {
+	#[inline]
+	fn matches_type(&self, kind: &str) -> bool {
+		matches_type_str(kind, self.types.as_deref(), &self.not_types)
+	}
+
+	#[inline]
+	fn matches_any_type(&self) -> bool {
+		matches_any_type(self.types.as_deref(), &self.not_types)
+	}
+}
+
+impl MatchesType for Filter {
+	#[inline]
+	fn matches_type(&self, kind: &str) -> bool {
+		matches_type_str(kind, self.types.as_deref(), &self.not_types)
+	}
+
+	#[inline]
+	fn matches_any_type(&self) -> bool {
+		matches_any_type(self.types.as_deref(), &self.not_types)
+	}
+}
+
 impl Matches<&RoomId> for RoomFilter {
 	#[inline]
 	fn matches(&self, room_id: &RoomId) -> bool {
@@ -134,17 +168,59 @@ fn matches_sender<E: Event>(event: &E, filter: &RoomEventFilter) -> bool {
 fn matches_type<E: Event>(event: &E, filter: &RoomEventFilter) -> bool {
 	let kind = event.kind().to_cow_str();
 
-	if filter.not_types.iter().any(is_equal_to!(&kind)) {
+	matches_type_str(&kind, filter.types.as_deref(), &filter.not_types)
+}
+
+fn matches_type_str(kind: &str, types: Option<&[String]>, not_types: &[String]) -> bool {
+	if not_types
+		.iter()
+		.any(|pattern| type_pattern_matches(pattern, kind))
+	{
 		return false;
 	}
 
-	if let Some(types) = filter.types.as_ref()
-		&& !types.iter().any(is_equal_to!(&kind))
+	if let Some(types) = types
+		&& !types
+			.iter()
+			.any(|pattern| type_pattern_matches(pattern, kind))
 	{
 		return false;
 	}
 
 	true
+}
+
+fn matches_any_type(types: Option<&[String]>, not_types: &[String]) -> bool {
+	!not_types.iter().any(|pattern| pattern == "*") && types.is_none_or(|types| !types.is_empty())
+}
+
+/// Match one `types`/`not_types` entry against an event type. Per the spec a
+/// `*` is a wildcard matching any sequence of characters (so `*` alone matches
+/// every type and `m.room.*` matches `m.room.member`); entries without a `*`
+/// keep the exact comparison.
+fn type_pattern_matches(pattern: &str, kind: &str) -> bool {
+	if !pattern.contains('*') {
+		return pattern == kind;
+	}
+
+	let mut segments = pattern.split('*');
+	let first = segments.next().unwrap_or_default();
+	let last = segments.next_back().unwrap_or_default();
+	let Some(mut rest) = kind.strip_prefix(first) else {
+		return false;
+	};
+
+	// Inner segments are matched leftmost; with `*` as the only metacharacter
+	// the earliest occurrence leaves the most room for what follows.
+	for segment in segments {
+		let Some((_, after)) = rest.split_once(segment) else {
+			return false;
+		};
+
+		rest = after;
+	}
+
+	rest.ends_with(last)
 }
 
 fn matches_url<E: Event>(event: &E, filter: &RoomEventFilter) -> bool {
@@ -263,7 +339,26 @@ fn split_field(field: &str) -> FieldPath {
 
 #[cfg(test)]
 mod tests {
-	use super::split_field;
+	use super::{split_field, type_pattern_matches};
+
+	#[test]
+	fn type_pattern_exact() {
+		assert!(type_pattern_matches("m.room.message", "m.room.message"));
+		assert!(!type_pattern_matches("m.room.message", "m.room.messages"));
+	}
+
+	#[test]
+	fn type_pattern_wildcards() {
+		assert!(type_pattern_matches("*", "m.room.member"));
+		assert!(type_pattern_matches("*", ""));
+		assert!(type_pattern_matches("m.room.*", "m.room.member"));
+		assert!(!type_pattern_matches("m.room.*", "m.reaction"));
+		assert!(type_pattern_matches("*.member", "m.room.member"));
+		assert!(type_pattern_matches("m.*.m*r", "m.room.member"));
+		assert!(!type_pattern_matches("m.*.x*r", "m.room.member"));
+		assert!(type_pattern_matches("a*a", "aa"));
+		assert!(!type_pattern_matches("a*a", "a"));
+	}
 
 	fn segments(field: &str) -> Vec<String> { split_field(field).into_vec() }
 

@@ -1,14 +1,10 @@
 use ruma::OwnedUserId;
-use tokio::time::Instant;
 use tuwunel_core::Result;
 
 use crate::admin_command;
 
 #[admin_command]
 pub(super) async fn password_hash(&self, user_id: OwnedUserId) -> Result {
-	let timer = Instant::now();
-	let result = self.services.users.password_hash(&user_id).await;
-	let query_time = timer.elapsed();
-
-	write!(self, "Query completed in {query_time:?}:\n\n```rs\n{result:#?}\n```").await
+	self.write_timed_query(self.services.users.password_hash(&user_id))
+		.await
 }

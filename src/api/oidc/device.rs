@@ -10,9 +10,8 @@ use axum::{
 };
 use http::{
 	StatusCode,
-	header::{CACHE_CONTROL, CONTENT_SECURITY_POLICY, PRAGMA, REFERRER_POLICY},
+	header::{CACHE_CONTROL, PRAGMA, REFERRER_POLICY},
 };
-use ruma::OwnedUserId;
 use serde::Deserialize;
 use serde_json::json;
 use tuwunel_core::{Err, Error, Result, err};
@@ -23,13 +22,11 @@ use tuwunel_service::{
 use url::Url;
 
 use self::{consent::consent_html, entry::entry_html, error::error_html, result::result_html};
-use super::{oauth_error, url_encode};
+use super::{
+	authorize::should_serve_native, consume_login_token, oauth_error, peek_login_token,
+	sso_redirect_url, url_encode,
+};
 use crate::ClientIp;
-
-// Per-response CSP: the consent form needs form-action 'self', which the global
-// policy forbids.
-static DEVICE_CSP: &str = "default-src 'none'; style-src 'self'; form-action 'self'; \
-                           frame-ancestors 'none'; base-uri 'none';";
 
 static DEVICE_HEAD: &str = r#"
 	<meta charset="UTF-8">
@@ -126,7 +123,7 @@ fn device_authorization_error(e: Error) -> Response {
 }
 
 /// RFC 8628 §3.3: the `verification_uri`. Shows a user-code entry form, or
-/// (with a valid code) sends the user through SSO to authenticate and consent.
+/// sends the user through native or SSO authentication before consent.
 pub(crate) async fn get_device_route(
 	State(services): State<crate::State>,
 	ClientIp(client): ClientIp,
@@ -160,17 +157,39 @@ fn handle_device_verify(services: &Services, user_code: Option<&str>) -> Result<
 		return Ok(device_html_response(StatusCode::OK, entry_html(None)));
 	};
 
-	// Authenticate before validating the code. Revealing whether a code is live
-	// to an unauthenticated caller is the RFC 8628 §5.1 brute-force oracle, so
-	// the code is checked only in the post-SSO callback.
-	device_sso_redirect(services, user_code)
+	// Validating the code before authentication exposes the RFC 8628 §5.1
+	// brute-force oracle, so defer it to the authenticated callback.
+	let idp_id = services.oauth.providers.get_default_id();
+	let serve_native =
+		should_serve_native(services.config.oidc_native_auth, idp_id.is_some(), false);
+
+	match serve_native {
+		| true => device_native_redirect(services, user_code),
+		| false => device_sso_redirect(services, user_code, idp_id.as_deref()),
+	}
 }
 
-fn device_sso_redirect(services: &Services, user_code: &str) -> Result<Response> {
-	let idp_id = services
-		.oauth
-		.providers
-		.get_default_id()
+fn device_native_redirect(services: &Services, user_code: &str) -> Result<Response> {
+	let issuer = services.oauth.get_server()?.issuer_url()?;
+	let base = issuer.trim_end_matches('/');
+
+	let native_url = Url::parse(&format!("{base}/_tuwunel/oidc/native"))
+		.map(|mut url| {
+			url.query_pairs_mut()
+				.append_pair("user_code", user_code);
+			url
+		})
+		.map_err(|_| err!(Request(InvalidParam("Failed to build native login URL"))))?;
+
+	Ok(device_redirect_response(Redirect::temporary(native_url.as_str())))
+}
+
+fn device_sso_redirect(
+	services: &Services,
+	user_code: &str,
+	idp_id: Option<&str>,
+) -> Result<Response> {
+	let idp_id = idp_id
 		.ok_or_else(|| err!(Config("identity_provider", "No identity provider configured")))?;
 
 	let issuer = services.oauth.get_server()?.issuer_url()?;
@@ -183,19 +202,13 @@ fn device_sso_redirect(services: &Services, user_code: &str) -> Result<Response>
 		.query_pairs_mut()
 		.append_pair("user_code", user_code);
 
-	let idp_id_enc = url_encode(&idp_id);
-	let mut sso_url =
-		Url::parse(&format!("{base}/_matrix/client/v3/login/sso/redirect/{idp_id_enc}"))
-			.map_err(|_| err!(Request(InvalidParam("Failed to build SSO URL"))))?;
-
-	sso_url
-		.query_pairs_mut()
-		.append_pair("redirectUrl", callback_url.as_str());
+	let sso_url = sso_redirect_url(base, idp_id, &callback_url)?;
 
 	Ok(device_redirect_response(Redirect::temporary(sso_url.as_str())))
 }
 
-/// The SSO return target: renders the consent form for the authenticated user.
+/// The authentication return target: renders consent for the authenticated
+/// user.
 pub(crate) async fn get_device_callback_route(
 	State(services): State<crate::State>,
 	ClientIp(client): ClientIp,
@@ -319,36 +332,12 @@ async fn handle_device_callback_post(
 	}
 }
 
-async fn peek_login_token(services: &Services, token: Option<&str>) -> Result<OwnedUserId> {
-	let token = token.ok_or_else(|| err!(Request(Forbidden("Missing login token"))))?;
-
-	services
-		.users
-		.peek_login_token(token)
-		.await
-		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
-}
-
-async fn consume_login_token(services: &Services, token: Option<&str>) -> Result<OwnedUserId> {
-	let token = token.ok_or_else(|| err!(Request(Forbidden("Missing login token"))))?;
-
-	services
-		.users
-		.find_from_login_token(token)
-		.await
-		.map_err(|_| err!(Request(Forbidden("Invalid or expired login token"))))
-}
-
 fn device_redirect_response(redirect: Redirect) -> Response {
 	([(CACHE_CONTROL, "no-store"), (REFERRER_POLICY, "no-referrer")], redirect).into_response()
 }
 
 fn device_html_response(status: StatusCode, html: String) -> Response {
-	let headers = [
-		(CACHE_CONTROL, "no-store"),
-		(CONTENT_SECURITY_POLICY, DEVICE_CSP),
-		(REFERRER_POLICY, "no-referrer"),
-	];
+	let headers = [(CACHE_CONTROL, "no-store"), (REFERRER_POLICY, "no-referrer")];
 
 	(status, headers, Html(html)).into_response()
 }

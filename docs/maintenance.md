@@ -64,6 +64,32 @@ performance. See <https://btrfs.readthedocs.io/en/latest/Compression.html#compat
 > buffered writes and leads to no compression even if force compression is set.
 > Currently nodatasum and compression don’t work together.
 
+### btrfs
+
+btrfs is Copy-on-Write, which interacts badly with the way RocksDB allocates
+its write-ahead logs. Set `rocksdb_allow_fallocate = false` in `tuwunel.toml`.
+Preallocation cannot reserve in-place write space on a CoW filesystem anyway,
+so there is nothing to lose by turning it off there.
+
+RocksDB preallocates each WAL with `fallocate(2)`, writes to it, then truncates
+it to the written length on close. btrfs does not split the preallocated extent
+on truncation: for as long as the file references any part of it, the whole
+extent stays allocated. A WAL holding a few kilobytes of records can pin tens
+of megabytes of disk this way.
+
+Obsolete WALs compound it. They are moved to `database_path/archive` and reaped
+only once the archive passes 1 GB, which RocksDB measures from the length of
+the files rather than the space they occupy. Truncated WALs therefore sit there
+far longer than their real cost warrants, and they accumulate quickly on a
+server taking live traffic.
+
+The gap between those two numbers is what makes this hard to recognize. `du`
+reports the small one; only `df` or `btrfs filesystem usage` shows the disk
+filling. `compsize` reports both for a directory. Defragmenting does not give
+the space back, so the files have to be rewritten or removed: setting the
+option stops any further growth, and an offline copy of `database_path` (see
+[Offline backups](#offline-backups)) reclaims what has already accumulated.
+
 ### ZFS
 
 ZFS has several quirks that interact badly with RocksDB defaults. Apply both
@@ -123,16 +149,65 @@ database online without any downtime, see the `!admin server` command for the
 backup commands and the `database_backup_path` config options in the example
 config.
 
-Please note that the format of the database backup is not the exact same. This is
-unfortunately a bad design choice by Facebook as we are using the database backup
-engine API from RocksDB, however the data is still there and can still be joined
-together.
+Please note that the format of the database backup is not the exact same as the
+database itself. This is unfortunately a design choice by Facebook, as we are
+using the database backup engine API from RocksDB; the data is all still there,
+and Tuwunel restores it for you (see below).
+
+A backup can be checked at any time with `!admin server verify-backup [id]`,
+which confirms all of the backup's files are still present with their expected
+sizes. File checksums are additionally verified while a backup is restored.
 
 #### Restoring online backup
 
-To restore a backup from an online RocksDB backup:
+To restore a backup, shut down Tuwunel, then start it once with the
+`--restore-backup` command line argument:
 
-- shutdown Tuwunel
+```bash
+tuwunel --restore-backup
+```
+
+This restores the most recent backup found in `database_backup_path` into
+`database_path`, verifying the checksum of every file along the way, then
+continues starting up normally on the restored database. To restore a specific
+backup instead, pass its ID as listed by `!admin server list-backups`:
+
+```bash
+tuwunel --restore-backup=3
+```
+
+The restore replaces the database files in `database_path`. The `media/`
+directory inside it is not part of an online backup and is left in place by
+RocksDB's restore; since media has no backup to restore from, copying it
+aside beforehand is cheap insurance. Only `--restore-backup` selects a backup;
+the setting is refused from a configuration file, from the environment, and
+from `-O`, so a forgotten one cannot roll the database back again on a later
+restart. A configuration reload does not carry the setting forward either, and
+an in-place `!admin server restart` drops it, which would otherwise repeat the
+restore in the process it starts.
+
+With systemd, run the restore as the service user while the service is
+stopped, then start the service again:
+
+```bash
+systemctl stop tuwunel
+sudo -u tuwunel tuwunel --config /etc/tuwunel/tuwunel.toml --restore-backup \
+	--maintenance --execute "server shutdown"
+systemctl start tuwunel
+```
+
+`--maintenance` keeps the restore run from serving clients, and `--execute
+"server shutdown"` exits it cleanly once startup, and therefore the restore,
+has completed. Both can be omitted to simply continue running on the restored
+database. With Docker or Podman, the image's entrypoint is the `tuwunel`
+binary, so append `--restore-backup` to a one-off `docker run` with your usual
+volumes and environment, then recreate your normal container.
+
+##### Restoring by hand
+
+If the server binary cannot be run for some reason, a backup can also be
+reassembled manually:
+
 - create a new directory for merging together the data
 - in the online backup created, copy all `.sst` files in
 `$DATABASE_BACKUP_PATH/shared_checksum` to your new directory

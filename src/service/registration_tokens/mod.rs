@@ -7,7 +7,7 @@ pub use data::{DatabaseTokenInfo, TokenExpires};
 use futures::{Stream, StreamExt, pin_mut};
 use tuwunel_core::{
 	Err, Result, error,
-	utils::{self, IterStream},
+	utils::{IterStream, random_string},
 };
 
 const RANDOM_TOKEN_LENGTH: usize = 16;
@@ -35,7 +35,7 @@ impl PartialEq<str> for ValidToken {
 }
 
 /// The source of a valid database token.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum ValidTokenSource {
 	/// The static token set in the homeserver's config file, which is
 	/// always valid.
@@ -65,16 +65,39 @@ impl crate::Service for Service {
 }
 
 impl Service {
-	/// Issue a new registration token and save it in the database.
-	pub async fn issue_token(
+	/// Create a registration token, using the caller's token or generating a
+	/// random one of `length` characters (default `RANDOM_TOKEN_LENGTH`). A
+	/// token that already exists is rejected.
+	pub async fn create_token(
 		&self,
+		token: Option<&str>,
+		length: Option<usize>,
 		expires: TokenExpires,
 	) -> Result<(String, DatabaseTokenInfo)> {
-		let token = utils::random_string(RANDOM_TOKEN_LENGTH);
+		let token = token.map(ToOwned::to_owned).unwrap_or_else(|| {
+			let length = length.unwrap_or(RANDOM_TOKEN_LENGTH);
+
+			random_string(length)
+		});
 
 		let info = self.db.save_token(&token, expires).await?;
 
 		Ok((token, info))
+	}
+
+	/// Look up a token's stored metadata, returning `None` when it is absent.
+	pub async fn get_token_info(&self, token: &str) -> Result<Option<DatabaseTokenInfo>> {
+		self.db.get_token_info(token).await
+	}
+
+	/// Replace a token's expiry, preserving its use counter. Returns a `404`
+	/// when the token is unknown.
+	pub async fn update_token(
+		&self,
+		token: &str,
+		expires: TokenExpires,
+	) -> Result<DatabaseTokenInfo> {
+		self.db.update_token(token, expires).await
 	}
 
 	pub async fn is_enabled(&self) -> bool {

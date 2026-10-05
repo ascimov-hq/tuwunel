@@ -18,6 +18,7 @@ OIDC server page.
 - [Authelia](providers/authelia.md)
 - [Authentik](providers/authentik.md)
 - [Keycloak](providers/keycloak.md)
+- [Matrix Authentication Service (MAS)](providers/mas.md)
 - _Please contribute documentation for yours here!_
 
 ## Configuring Tuwunel
@@ -62,7 +63,7 @@ please refer to the section on [environment variables](#configuring-via-environm
 | `default` | `false` | Mark this provider as the default for `/_matrix/client/v3/login/sso/redirect` (the endpoint without a provider ID). Required when multiple providers are configured and some clients (e.g. FluffyChat) need a single redirect target. If exactly one provider is configured it is implicitly the default. **(Experimental)** Multiple providers can share `default = true` — all must authorize successfully in sequence. |
 | `name` | `brand` | Display name shown on the login page. Useful when multiple providers share the same brand. |
 | `icon` | brand default | MXC URI for the provider's icon. Known brands have built-in icons. |
-| `scope` | all | List of OAuth scopes to request. Empty array means all scopes configured in the provider application. Users can further restrict scopes during authorization. |
+| `scope` | `openid email profile`; MAS: `openid` | List of OAuth scopes to request. An empty array uses the default shown here. Users can further restrict scopes during authorization. |
 | `forward_action_prompt` | `false` | Forward the `action` query parameter from the SSO redirect endpoints to this provider as an OpenID Connect `prompt`. When enabled, `action=register` makes the upstream authorization request carry `prompt=create` so the provider shows its registration screen; `action=login` is left unforwarded. Only enable it for providers that support the OIDC `prompt=create` ("Initiating User Registration") extension. See [Registration hints](#registration-hints-for-oauth-aware-clients). |
 
 ### User ID mapping
@@ -182,11 +183,16 @@ control the identity provider.
 ```toml
 [[global.identity_provider]]
 brand = "MAS"
-client_id = "your_mas_client_id"
-client_secret = "your_mas_secret"
+client_id = "01J44Q10GR4AMTFZEEF936DTCM"
+client_secret = "<client_secret>"
 issuer_url = "https://auth.example.com"
-callback_url = "https://matrix.example.com/_matrix/client/unstable/login/sso/callback/your_mas_client_id"
+callback_url = "https://matrix.example.com/_matrix/client/unstable/login/sso/callback/01J44Q10GR4AMTFZEEF936DTCM"
 ```
+
+MAS attaches as an upstream provider; Tuwunel remains its own next-generation
+auth issuer. See the [MAS guide](providers/mas.md) for the full topology, the
+client registration on the MAS side, and why `authorization_url` must stay
+unset.
 
 ## Common setup patterns
 

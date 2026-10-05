@@ -14,6 +14,10 @@ Environment="TUWUNEL_CONFIG=/etc/tuwunel/tuwunel.toml"
 
 ExecStart=/usr/sbin/tuwunel
 
+# Type=notify-reload would report completion, but it needs systemd 253 and
+# Enterprise Linux 9 ships 252, where an unparsable Type= falls back to simple.
+ExecReload=/bin/kill -s USR1 $MAINPID
+
 ReadWritePaths=/var/lib/tuwunel /etc/tuwunel
 
 AmbientCapabilities=
@@ -48,6 +52,9 @@ RestrictSUIDSGID=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service @resources
 SystemCallFilter=~@clock @debug @module @mount @reboot @swap @cpu-emulation @obsolete @timer @chown @setuid @privileged @keyring @ipc
+# Restore the pipe syscalls subtracted with @ipc above: a configured
+# media_video_thumbnail_command is spawned with pipes.
+SystemCallFilter=pipe pipe2
 SystemCallErrorNumber=EPERM
 
 RuntimeDirectory=tuwunel
@@ -57,7 +64,7 @@ Restart=on-failure
 RestartSec=5
 
 TimeoutStopSec=2m
-TimeoutStartSec=2m
+TimeoutStartSec=5m
 
 StartLimitInterval=1m
 StartLimitBurst=5

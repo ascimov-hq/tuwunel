@@ -4,7 +4,6 @@ use std::{
 	ffi::OsStr,
 	fs,
 	fs::{FileType, read_to_string},
-	iter::IntoIterator,
 	path::{Path, PathBuf},
 };
 
@@ -179,20 +178,36 @@ pub fn name_from_path(path: &Path) -> Result<String> {
 }
 
 /// Get the (major, minor) of the block device on which Path is mounted.
-//TODO: Use conditional cfg for expect() minding cross-platformness.
-#[allow(
-	clippy::useless_conversion,
-	clippy::unnecessary_fallible_conversions
-)]
 fn dev_from_path(path: &Path) -> Result<(dev_t, dev_t)> {
 	#[cfg(target_family = "unix")]
 	use std::os::unix::fs::MetadataExt;
 
 	let stat = fs::metadata(path)?;
+
+	// Metadata::dev() is u64 on every unix; dev_t itself is not, so the
+	// conversions below differ per platform.
+	#[cfg(target_os = "linux")]
+	let dev_id = stat.dev();
+
+	#[cfg(not(target_os = "linux"))]
 	let dev_id = stat.dev().try_into()?;
+
 	let (major, minor) = (libc::major(dev_id), libc::minor(dev_id));
 
-	Ok((major.try_into()?, minor.try_into()?))
+	#[cfg(target_os = "linux")]
+	let (major, minor) = (major.into(), minor.into());
+
+	#[cfg(target_os = "android")]
+	let (major, minor) = (major.try_into()?, minor.try_into()?);
+
+	#[cfg(not(any(
+		target_os = "linux",
+		target_os = "android",
+		target_vendor = "apple"
+	)))]
+	let (major, minor) = (major.try_into()?, minor.try_into()?);
+
+	Ok((major, minor))
 }
 
 fn block_path((major, minor): (dev_t, dev_t)) -> PathBuf {

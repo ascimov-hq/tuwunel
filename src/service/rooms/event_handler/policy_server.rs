@@ -3,6 +3,7 @@ use std::{
 	time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use http::StatusCode;
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, EventId, OwnedServerName, RoomId, RoomVersionId,
 	ServerName, SigningKeyAlgorithm,
@@ -10,7 +11,10 @@ use ruma::{
 		error::{ErrorKind, RetryAfter},
 		federation::policy::sign_event::v1 as sign_event,
 	},
-	events::{StateEventType, room::policy::RoomPolicyEventContent},
+	events::{
+		StateEventType,
+		room::policy::{POLICY_SERVER_ED25519_SIGNING_KEY_ID, RoomPolicyEventContent},
+	},
 	serde::Base64,
 	signatures::{to_canonical_json_string_for_signing, verify_canonical_json_bytes},
 };
@@ -18,21 +22,25 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::to_raw_value;
 use tuwunel_core::{
 	Err, Result, at, debug, implement,
-	matrix::{Event, pdu::into_outgoing_federation, room_version},
+	matrix::{Event, pdu::into_outgoing_federation, room_version::rules as room_version_rules},
 	trace,
 	utils::time::now_secs,
 	warn,
 };
 use tuwunel_database::{Cbor, Deserialized};
 
+#[cfg(test)]
+mod tests;
+
 /// MSC4284 unstable state event type. The merged spec stabilised this to
 /// `m.room.policy`, but the reference policy server (and Element's default
 /// deployments as of 2026-05) still write the unstable type with the singular
 /// `public_key` field; reading both keeps the gate live for those rooms.
 const UNSTABLE_POLICY_TYPE: &str = "org.matrix.msc4284.policy";
+const POLICY_REFUSAL_TTL: Duration = Duration::from_hours(24);
 
 /// Outcome of an inbound policy-server signature check.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum PolicyCheck {
 	/// No policy server is configured for this room (or feature is off, or
 	/// the event is the policy state event itself). The caller should not
@@ -60,9 +68,15 @@ enum FetchOutcome {
 	/// Network error or timeout; the caller should fail open.
 	FailOpen,
 
-	/// Policy server explicitly refused (Forbidden), or returned 200 OK
-	/// with no signature for our `via` (the MSC4284 unstable refusal).
-	Refused,
+	/// Policy server explicitly refused the event.
+	///
+	/// A 400 `M_FORBIDDEN` is ambiguous because policyserv also uses it for
+	/// unknown rooms and invalid origin signatures. A 200 without a signature
+	/// for `via` is the unstable refusal form.
+	Refused {
+		status: StatusCode,
+		errcode: Option<ErrorKind>,
+	},
 
 	/// Policy server returned `M_LIMIT_EXCEEDED`. The caller should record
 	/// the unix-secs deadline so subsequent attempts before then are
@@ -76,8 +90,12 @@ enum FetchOutcome {
 /// Absence of a row means "no prior decision recorded; proceed with `/sign`".
 #[derive(Debug, Serialize, Deserialize)]
 enum PolicySigState {
-	/// Policy server already refused this event; do not retry.
-	Refused,
+	/// Policy server refused this event.
+	///
+	/// Requests wait until this unix-secs deadline before retrying.
+	Refused {
+		until_secs: u64,
+	},
 
 	/// Policy server is rate-limiting; do not retry before this unix-secs
 	/// deadline.
@@ -115,11 +133,21 @@ fn into_stable(
 	Some(RoomPolicyEventContent::new(via, ed25519))
 }
 
+/// Clears the cached policy server decision for an event.
+///
+/// A later validation can contact the policy server again.
+#[implement(super::Service)]
+pub fn clear_policy_signature_state(&self, event_id: &EventId) {
+	self.db.eventid_policysigstate.remove(event_id);
+}
+
 #[implement(super::Service)]
 fn cache_policy_refused(&self, event_id: &EventId) {
+	let until_secs = now_secs().saturating_add(POLICY_REFUSAL_TTL.as_secs());
+
 	self.db
 		.eventid_policysigstate
-		.raw_put(event_id.as_str(), Cbor(&PolicySigState::Refused));
+		.raw_put(event_id.as_str(), Cbor(&PolicySigState::Refused { until_secs }));
 }
 
 #[implement(super::Service)]
@@ -131,13 +159,27 @@ fn cache_policy_backoff(&self, event_id: &EventId, until_secs: u64) {
 
 #[implement(super::Service)]
 async fn cached_policy_state(&self, event_id: &EventId) -> Option<PolicySigState> {
-	self.db
+	let state = self
+		.db
 		.eventid_policysigstate
 		.get(event_id.as_str())
 		.await
-		.deserialized::<Cbor<_>>()
+		.deserialized::<Cbor<_>>();
+
+	current_policy_state(state, now_secs())
+}
+
+fn current_policy_state(
+	state: Result<Cbor<PolicySigState>>,
+	current_secs: u64,
+) -> Option<PolicySigState> {
+	state
 		.map(at!(0))
 		.ok()
+		.filter(|state| match state {
+			| PolicySigState::Refused { until_secs }
+			| PolicySigState::BackoffUntil { until_secs } => *until_secs > current_secs,
+		})
 }
 
 /// Returns the room's policy event content when a policy server is in effect:
@@ -205,7 +247,7 @@ where
 
 	let event_id = pdu.event_id();
 	match self.cached_policy_state(event_id).await {
-		| Some(PolicySigState::Refused) =>
+		| Some(PolicySigState::Refused { .. }) =>
 			return Err!(Request(Forbidden("Event was rejected by the room's policy server."))),
 
 		| Some(PolicySigState::BackoffUntil { until_secs }) if until_secs > now_secs() => {
@@ -223,7 +265,16 @@ where
 			insert_policy_signature(pdu_json, &policy.via, &signature);
 			debug!(via = %policy.via, event_id = %event_id, "folded policy server signature");
 		},
-		| FetchOutcome::Refused => {
+		| FetchOutcome::Refused { status, errcode } => {
+			warn!(
+				via = %policy.via,
+				event_id = %event_id,
+				room_id = %pdu.room_id(),
+				status = status.as_u16(),
+				?errcode,
+				"policy server refused to sign outbound PDU"
+			);
+
 			self.cache_policy_refused(event_id);
 			return Err!(Request(Forbidden("Event was rejected by the room's policy server.")));
 		},
@@ -274,14 +325,45 @@ async fn fetch_policy_signature(
 	.await
 	{
 		| Ok(Ok(response)) => response,
-		| Ok(Err(error)) if error.kind() == ErrorKind::Forbidden => return FetchOutcome::Refused,
 		| Ok(Err(error)) => {
-			if let Some(until_secs) = parse_rate_limit(&error) {
-				warn!(via = %policy.via, until_secs, "policy server /sign rate-limited");
-				return FetchOutcome::RateLimited { until_secs };
+			let status = error.status_code();
+			let errcode = error.kind();
+			let outcome = classify_fetch_error(status, &errcode, parse_rate_limit(&error));
+
+			if let FetchOutcome::RateLimited { until_secs } = &outcome {
+				warn!(
+					via = %policy.via,
+					status = status.as_u16(),
+					?errcode,
+					until_secs,
+					"policy server /sign rate-limited"
+				);
 			}
-			warn!(via = %policy.via, %error, "policy server /sign failed; failing open");
-			return FetchOutcome::FailOpen;
+
+			if matches!(&outcome, FetchOutcome::FailOpen) {
+				let expected_not_found = status == StatusCode::NOT_FOUND
+					&& (errcode == ErrorKind::NotFound || errcode == ErrorKind::Unrecognized);
+
+				if expected_not_found {
+					debug!(
+						via = %policy.via,
+						status = status.as_u16(),
+						?errcode,
+						%error,
+						"policy server does not support /sign; failing open"
+					);
+				} else {
+					warn!(
+						via = %policy.via,
+						status = status.as_u16(),
+						?errcode,
+						%error,
+						"policy server /sign failed; failing open"
+					);
+				}
+			}
+
+			return outcome;
 		},
 		| Err(elapsed) => {
 			warn!(via = %policy.via, %elapsed, "policy server /sign timed out; failing open");
@@ -293,7 +375,23 @@ async fn fetch_policy_signature(
 	response
 		.ed25519_signature(&policy.via)
 		.map(ToOwned::to_owned)
-		.map_or(FetchOutcome::Refused, FetchOutcome::Signed)
+		.map_or(
+			FetchOutcome::Refused { status: StatusCode::OK, errcode: None },
+			FetchOutcome::Signed,
+		)
+}
+
+fn classify_fetch_error(
+	status: StatusCode,
+	errcode: &ErrorKind,
+	rate_limit_until: Option<u64>,
+) -> FetchOutcome {
+	match rate_limit_until {
+		| Some(until_secs) => FetchOutcome::RateLimited { until_secs },
+		| None if status == StatusCode::BAD_REQUEST && errcode == &ErrorKind::Forbidden =>
+			FetchOutcome::Refused { status, errcode: Some(errcode.clone()) },
+		| None => FetchOutcome::FailOpen,
+	}
 }
 
 fn parse_rate_limit(error: &tuwunel_core::Error) -> Option<u64> {
@@ -312,11 +410,10 @@ fn parse_rate_limit(error: &tuwunel_core::Error) -> Option<u64> {
 		.map(|d| d.as_secs())
 }
 
-/// MSC4284: verify the inbound PDU's policy server signature; if missing, ask
-/// the policy server to sign and fold the result in. Mirrors
-/// `check_inbound_policy_signature` but upgrades `Missing` to `Pass` (fetched
-/// and verified, or fail-open on network error/timeout) or `Invalid`
-/// (refused).
+/// MSC4284: verify the inbound PDU's policy server signature.
+///
+/// Missing or invalid signatures are fetched again because the policy server's
+/// key may have rotated. A fetched signature is folded into the event.
 #[implement(super::Service)]
 #[tracing::instrument(name = "policy_verify_or_fetch", level = "debug", skip_all)]
 pub async fn verify_or_fetch_inbound_policy_signature<E>(
@@ -331,21 +428,17 @@ where
 		.check_inbound_policy_signature(pdu_json, pdu)
 		.await
 	{
-		| PolicyCheck::Missing =>
+		| PolicyCheck::Missing | PolicyCheck::Invalid =>
 			self.fetch_inbound_policy_signature(pdu_json, pdu)
 				.await,
 		| other => other,
 	}
 }
 
-/// MSC4284: when an inbound PDU has no policy server signature, ask the
-/// policy server to sign on the originator's behalf; fold the returned
-/// signature into `pdu_json` so it persists with the event and federates
-/// onward. Cached refusals short-circuit to `Invalid`; cached backoffs (or
-/// fresh 429s) fail open as `Pass` until the deadline. `Forbidden` from the
-/// policy server maps to `Invalid`. Network errors and timeouts fail open
-/// with a warn log, mapped to `Pass` since the next server in the room is
-/// likely to retry.
+/// MSC4284: fetch a missing or invalid inbound policy server signature.
+///
+/// The signature is folded into `pdu_json` so it persists and federates
+/// onward. Refusals map to `Invalid`; transient failures map to `Pass`.
 #[implement(super::Service)]
 #[tracing::instrument(name = "policy_fetch_inbound", level = "debug", skip_all)]
 async fn fetch_inbound_policy_signature<E>(
@@ -371,7 +464,7 @@ where
 
 	let event_id = pdu.event_id();
 	match self.cached_policy_state(event_id).await {
-		| Some(PolicySigState::Refused) => return PolicyCheck::Invalid,
+		| Some(PolicySigState::Refused { .. }) => return PolicyCheck::Invalid,
 		| Some(PolicySigState::BackoffUntil { until_secs }) if until_secs > now_secs() => {
 			debug!(
 				until_secs,
@@ -398,10 +491,13 @@ where
 			insert_policy_signature(pdu_json, &policy.via, &signature);
 			PolicyCheck::Pass
 		},
-		| FetchOutcome::Refused => {
-			debug!(
+		| FetchOutcome::Refused { status, errcode } => {
+			warn!(
 				via = %policy.via,
 				event_id = %event_id,
+				room_id = %pdu.room_id(),
+				status = status.as_u16(),
+				?errcode,
 				"policy server refused to sign inbound PDU; soft-failing"
 			);
 
@@ -452,10 +548,6 @@ where
 		return PolicyCheck::NotApplicable;
 	};
 
-	let Ok(rules) = room_version::rules(&room_version) else {
-		return PolicyCheck::NotApplicable;
-	};
-
 	// `lookup_policy_server` already verified the ed25519 entry is present.
 	let Some(public_key) = policy
 		.public_keys
@@ -464,7 +556,20 @@ where
 		return PolicyCheck::NotApplicable;
 	};
 
-	let Some(signature_b64) = extract_policy_signature(pdu_json, &policy.via) else {
+	check_policy_signature(pdu_json, &room_version, &policy.via, public_key)
+}
+
+fn check_policy_signature(
+	pdu_json: &CanonicalJsonObject,
+	room_version: &RoomVersionId,
+	via: &ServerName,
+	public_key: &Base64,
+) -> PolicyCheck {
+	let Ok(rules) = room_version_rules(room_version) else {
+		return PolicyCheck::NotApplicable;
+	};
+
+	let Some(signature_b64) = extract_policy_signature(pdu_json, via) else {
 		return PolicyCheck::Missing;
 	};
 
@@ -489,7 +594,7 @@ where
 	)
 	.map(|()| PolicyCheck::Pass)
 	.unwrap_or_else(|error| {
-		debug!(via = %policy.via, %error, "policy server signature failed verification");
+		debug!(%via, %error, "policy server signature failed verification");
 		PolicyCheck::Invalid
 	})
 }
@@ -517,7 +622,7 @@ fn extract_policy_signature<'a>(
 	};
 
 	let CanonicalJsonValue::String(signature) =
-		key_map.get(RoomPolicyEventContent::POLICY_SERVER_ED25519_SIGNING_KEY_ID)?
+		key_map.get(POLICY_SERVER_ED25519_SIGNING_KEY_ID)?
 	else {
 		return None;
 	};
@@ -544,7 +649,7 @@ fn insert_policy_signature(
 
 	if let CanonicalJsonValue::Object(key_map) = entry {
 		key_map.insert(
-			RoomPolicyEventContent::POLICY_SERVER_ED25519_SIGNING_KEY_ID.into(),
+			POLICY_SERVER_ED25519_SIGNING_KEY_ID.into(),
 			CanonicalJsonValue::String(signature.to_owned()),
 		);
 	}

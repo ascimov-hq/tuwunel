@@ -1,53 +1,95 @@
 use std::{
-	collections::{HashMap as Map, hash_map::Entry},
+	collections::{HashMap, VecDeque},
 	iter::once,
 	ops::Deref,
 };
 
 use futures::{
-	Future, Stream, StreamExt,
+	Stream, StreamExt,
 	stream::{FuturesUnordered, unfold},
 };
-use ruma::OwnedEventId;
+use ruma::{EventId, OwnedEventId};
 use tuwunel_core::{
 	Result, implement, is_equal_to,
-	itertools::Itertools,
-	matrix::{Event, pdu::AuthEvents},
+	matrix::{Event, event_id::RandomState, pdu::AuthEvents},
 	smallvec::SmallVec,
 	utils::{
 		BoolExt,
+		math::expect_into,
 		stream::{IterStream, automatic_width},
 	},
 };
 
-#[derive(Default, Debug)]
 struct Global<Fut: Future + Send> {
 	subgraph: Subgraph,
 	todo: Todo<Fut>,
-	iter: usize,
+	locals: Locals,
+	waiters: Waiters,
+	ready: Ready,
+	deferred: Deferred,
+	parked: usize,
 }
 
-#[derive(Default, Debug)]
+struct Context<'a> {
+	subgraph: &'a mut Subgraph,
+	waiters: &'a mut Waiters,
+	ready: &'a mut Ready,
+	parked: &'a mut usize,
+	outputs: &'a mut Path,
+}
+
+#[derive(Debug, Default)]
 struct Local {
-	id: usize,
 	path: Path,
 	stack: Stack,
+	marked: usize,
 }
 
-#[derive(Default, Debug)]
-struct Substate {
-	subgraph: bool,
-	seen: bool,
+#[derive(Debug)]
+struct Wake {
+	event_id: OwnedEventId,
+	locals: Waiting,
+	result: Resolution,
+}
+
+#[derive(Debug)]
+enum Evaluation {
+	Continue,
+	Fetch(OwnedEventId),
+	Park,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Resolution {
+	Dead,
+	Subgraph,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Substate {
+	Conflicted,
+	/// Owned by the sole walker that will resolve it; that walker's path holds
+	/// exactly the nodes it owns, so a target it owns is a graph cycle.
+	Pending(LocalId),
+	Dead,
+	Subgraph,
 }
 
 type Todo<Fut> = FuturesUnordered<Fut>;
-type Subgraph = Map<OwnedEventId, Substate>;
+type Subgraph = HashMap<OwnedEventId, Substate, RandomState>;
+type Locals = Vec<Local>;
+type LocalId = u32;
+type Waiters = HashMap<OwnedEventId, Waiting, RandomState>;
+type Waiting = SmallVec<[usize; WAITING_INLINE]>;
+type Ready = Vec<Wake>;
+type Deferred = VecDeque<(usize, OwnedEventId)>;
 type Path = SmallVec<[OwnedEventId; PATH_INLINE]>;
 type Stack = SmallVec<[Frame; STACK_INLINE]>;
 type Frame = AuthEvents;
 
-const PATH_INLINE: usize = 32;
-const STACK_INLINE: usize = 32;
+const PATH_INLINE: usize = 4;
+const STACK_INLINE: usize = 4;
+const WAITING_INLINE: usize = 1;
 const CAPACITY_MULTIPLIER: usize = 4;
 
 #[tracing::instrument(
@@ -71,54 +113,213 @@ where
 		.len()
 		.saturating_mul(CAPACITY_MULTIPLIER);
 
+	let seeds = || conflicted_set.iter().map(Deref::deref).cloned();
+
+	// Seeding the conflicted set makes membership a free by-product of the
+	// entry each descent step already reads.
+	let mut subgraph = Subgraph::with_capacity_and_hasher(initial_capacity, RandomState);
+
+	subgraph.extend(seeds().map(|event_id| (event_id, Substate::Conflicted)));
+
 	let state = Global {
-		subgraph: Map::with_capacity(initial_capacity),
-		todo: Todo::<_>::new(),
-		iter: 0,
+		subgraph,
+		todo: Todo::new(),
+		locals: Locals::with_capacity(conflicted_set.len()),
+		waiters: Waiters::with_hasher(RandomState),
+		ready: Ready::new(),
+		deferred: Deferred::new(),
+		parked: 0,
 	};
 
-	let inputs = conflicted_set
-		.iter()
-		.map(Deref::deref)
-		.cloned()
-		.enumerate()
-		.map(Local::new)
-		.filter_map(Local::pop)
-		.map(|(local, event_id)| local.push(fetch, Some(event_id)));
+	unfold((seeds(), state), async |(mut inputs, mut state)| {
+		let width = automatic_width();
 
-	unfold((inputs, state), async |(mut inputs, mut state)| {
 		debug_assert!(
-			state.todo.len() <= automatic_width(),
-			"Excessive items todo in FuturesUnordered"
+			state.todo.len() <= width,
+			"Excessive in-flight conflicted-subgraph fetches"
 		);
 
-		while state.todo.len() < automatic_width()
-			&& let Some(input) = inputs.next()
-		{
-			state.todo.push(input);
+		while state.todo.len() < width {
+			if let Some((id, event_id)) = state.deferred.pop_front() {
+				state.todo.push(fetch_auth(id, event_id, fetch));
+				continue;
+			}
+
+			let Some(seed) = inputs.next() else {
+				break;
+			};
+
+			let id = state.locals.len();
+
+			state.locals.push(Local::default());
+			state.todo.push(fetch_auth(id, seed, fetch));
 		}
 
-		let outputs = state
-			.todo
-			.next()
-			.await?
-			.pop()
-			.map(|(local, event_id)| local.eval(&mut state, conflicted_set, event_id))
-			.map(|(local, next_id, outputs)| {
-				if !local.stack.is_empty() {
-					state.todo.push(local.push(fetch, next_id));
+		let Some((id, event_id, event)) = state.todo.next().await else {
+			debug_assert!(state.waiters.is_empty(), "Unresolved conflicted-subgraph waiters");
+			debug_assert!(state.ready.is_empty(), "Undrained conflicted-subgraph wakes");
+			debug_assert!(state.deferred.is_empty(), "Deferred conflicted-subgraph fetches");
+			debug_assert_eq!(state.parked, 0, "Parked conflicted-subgraph walkers");
+			return None;
+		};
+
+		while state.todo.len() < width
+			&& let Some((deferred_id, deferred_event_id)) = state.deferred.pop_front()
+		{
+			state
+				.todo
+				.push(fetch_auth(deferred_id, deferred_event_id, fetch));
+		}
+
+		let mut outputs = Path::new();
+
+		if let Some(next_id) = process_fetch(&mut state, id, event_id, event, &mut outputs) {
+			if state.todo.len() < width {
+				state.todo.push(fetch_auth(id, next_id, fetch));
+			} else {
+				state.deferred.push_back((id, next_id));
+			}
+		}
+
+		while let Some(Wake { event_id, locals, result }) = state.ready.pop() {
+			for id in locals {
+				if let Some(next_id) = resume(&mut state, id, &event_id, result, &mut outputs) {
+					if state.todo.len() < width {
+						state.todo.push(fetch_auth(id, next_id, fetch));
+					} else {
+						state.deferred.push_back((id, next_id));
+					}
 				}
+			}
+		}
 
-				outputs
-			})
-			.into_iter()
-			.flatten()
-			.stream();
-
-		state.iter = state.iter.saturating_add(1);
-		Some((outputs, (inputs, state)))
+		Some((outputs.into_iter().stream(), (inputs, state)))
 	})
 	.flatten()
+}
+
+fn fetch_auth<Fetch, Fut, Pdu>(
+	id: usize,
+	event_id: OwnedEventId,
+	fetch: &Fetch,
+) -> impl Future<Output = (usize, OwnedEventId, Result<Pdu>)> + Send
+where
+	Fetch: Fn(OwnedEventId) -> Fut,
+	Fut: Future<Output = Result<Pdu>> + Send,
+{
+	let fut = fetch(event_id.clone());
+
+	async move { (id, event_id, fut.await) }
+}
+
+fn process_fetch<Fut, Pdu>(
+	state: &mut Global<Fut>,
+	id: usize,
+	event_id: OwnedEventId,
+	event: Result<Pdu>,
+	outputs: &mut Path,
+) -> Option<OwnedEventId>
+where
+	Fut: Future + Send,
+	Pdu: Event,
+{
+	match event {
+		| Ok(event) => {
+			let local = &mut state.locals[id];
+
+			local.path.push(event_id);
+			local
+				.stack
+				.push(event.auth_events_into().into_iter().collect());
+		},
+		| Err(_) => {
+			let Global { subgraph, waiters, ready, parked, .. } = state;
+			let mut context = Context {
+				subgraph,
+				waiters,
+				ready,
+				parked,
+				outputs,
+			};
+
+			complete_pending(&mut context, event_id, Resolution::Dead);
+		},
+	}
+
+	advance(state, id, outputs)
+}
+
+fn resume<Fut: Future + Send>(
+	state: &mut Global<Fut>,
+	id: usize,
+	event_id: &EventId,
+	result: Resolution,
+	outputs: &mut Path,
+) -> Option<OwnedEventId> {
+	if matches!(result, Resolution::Subgraph) {
+		let Global {
+			subgraph, locals, waiters, ready, parked, ..
+		} = state;
+
+		let mut context = Context {
+			subgraph,
+			waiters,
+			ready,
+			parked,
+			outputs,
+		};
+
+		locals[id].insert_path(&mut context, event_id);
+	}
+
+	advance(state, id, outputs)
+}
+
+fn advance<Fut: Future + Send>(
+	state: &mut Global<Fut>,
+	id: usize,
+	outputs: &mut Path,
+) -> Option<OwnedEventId> {
+	let Global {
+		subgraph, locals, waiters, ready, parked, ..
+	} = state;
+
+	let local = &mut locals[id];
+	let mut context = Context {
+		subgraph,
+		waiters,
+		ready,
+		parked,
+		outputs,
+	};
+
+	while let Some(event_id) = local.pop(&mut context) {
+		match local.eval(id, &mut context, event_id) {
+			| Evaluation::Continue => {},
+			| Evaluation::Fetch(event_id) => return Some(event_id),
+			| Evaluation::Park => return None,
+		}
+	}
+
+	if local.stack.is_empty() {
+		*local = Local::default();
+	}
+
+	None
+}
+
+#[implement(Local)]
+fn pop(&mut self, context: &mut Context<'_>) -> Option<OwnedEventId> {
+	while self.stack.last().is_some_and(Frame::is_empty) {
+		self.stack.pop();
+
+		if let Some(event_id) = self.path.pop() {
+			complete_pending(context, event_id, Resolution::Dead);
+		}
+	}
+
+	self.marked = self.marked.min(self.path.len());
+	self.stack.last_mut().and_then(Frame::pop)
 }
 
 #[implement(Local)]
@@ -127,133 +328,156 @@ where
 	level = "trace",
 	skip_all,
 	fields(
-		i = state.iter,
-		s = ?state
+		s = ?context
 			.subgraph
 			.values()
-			.fold((0_u64, 0_u64), |(a, b), v| {
-				(a.saturating_add(u64::from(v.subgraph)), b.saturating_add(u64::from(v.seen)))
+			.fold((0_u64, 0_u64, 0_u64, 0_u64), |(pending, dead, conflicted, subgraph), state| {
+				match state {
+					| Substate::Pending(_) =>
+						(pending.saturating_add(1), dead, conflicted, subgraph),
+					| Substate::Dead => (pending, dead.saturating_add(1), conflicted, subgraph),
+					| Substate::Conflicted => {
+						(pending, dead, conflicted.saturating_add(1), subgraph)
+					},
+					| Substate::Subgraph => {
+						(pending, dead, conflicted, subgraph.saturating_add(1))
+					},
+				}
 			}),
 
 		%event_id,
-		id = self.id,
 		path = self.path.len(),
 		stack = self.stack.iter().flatten().count(),
 	)
 )]
-fn eval<Fut: Future + Send>(
-	mut self,
-	state: &mut Global<Fut>,
-	conflicted_event_ids: &Vec<&OwnedEventId>,
-	event_id: OwnedEventId,
-) -> (Self, Option<OwnedEventId>, Path) {
-	let Global { subgraph, .. } = state;
-
-	let insert_path_filter = |subgraph: &mut Subgraph, event_id: &OwnedEventId| match subgraph
-		.entry(event_id.clone())
-	{
-		| Entry::Occupied(state) if state.get().subgraph => false,
-		| Entry::Occupied(mut state) => {
-			state.get_mut().subgraph = true;
-			state.get().subgraph
+fn eval(&mut self, id: usize, context: &mut Context<'_>, event_id: OwnedEventId) -> Evaluation {
+	match context.subgraph.get(&event_id).copied() {
+		| Some(Substate::Subgraph) => {
+			self.insert_path(context, &event_id);
+			Evaluation::Continue
 		},
-		| Entry::Vacant(state) =>
-			state
-				.insert(Substate { subgraph: true, seen: false })
-				.subgraph,
-	};
+		| Some(Substate::Dead) => Evaluation::Continue,
+		| Some(Substate::Pending(owner)) => {
+			if expect_into::<usize, _>(owner) == id {
+				return Evaluation::Continue;
+			}
 
-	let insert_path = |subgraph: &mut Subgraph, local: &Local| {
-		local
-			.path
-			.iter()
-			.filter(|&event_id| insert_path_filter(subgraph, event_id))
-			.cloned()
-			.collect()
-	};
+			context
+				.waiters
+				.entry(event_id)
+				.or_default()
+				.push(id);
 
-	let is_conflicted = |event_id: &OwnedEventId| {
-		conflicted_event_ids
-			.binary_search(&event_id)
-			.is_ok()
-	};
+			*context.parked = context.parked.saturating_add(1);
+			Evaluation::Park
+		},
+		| Some(Substate::Conflicted) => {
+			self.insert_path(context, &event_id);
 
-	let mut entry = subgraph.entry(event_id.clone());
+			self.path
+				.first()
+				.is_some_and(is_equal_to!(&event_id))
+				.is_false()
+				.then_some(event_id)
+				.map_or(Evaluation::Continue, Evaluation::Fetch)
+		},
+		| None => {
+			context
+				.subgraph
+				.insert(event_id.clone(), Substate::Pending(expect_into(id)));
 
-	if let Entry::Occupied(state) = &entry
-		&& state.get().subgraph
-	{
-		let path = (self.path.len() > 1)
-			.then(|| insert_path(subgraph, &self))
-			.unwrap_or_default();
-
-		self.path.pop();
-		return (self, None, path);
+			Evaluation::Fetch(event_id)
+		},
 	}
+}
 
-	if let Entry::Occupied(state) = &mut entry {
-		state.get_mut().seen = true;
-		return (self, None, Path::new());
-	}
+#[implement(Local)]
+fn insert_path(&mut self, context: &mut Context<'_>, event_id: &EventId) {
+	let Context {
+		subgraph,
+		waiters,
+		ready,
+		parked,
+		outputs,
+	} = context;
 
-	if let Entry::Vacant(state) = entry {
-		state.insert(Substate { subgraph: false, seen: true });
-	}
-
-	let path = (self.path.len() > 1)
-		.and_if(|| is_conflicted(&event_id))
-		.then(|| insert_path(subgraph, &self))
-		.unwrap_or_default();
-
-	let next_id = self
-		.path
+	let inserted = self.path[self.marked..]
 		.iter()
-		.dropping_back(1)
-		.any(is_equal_to!(&event_id))
-		.is_false()
-		.then_some(event_id);
+		.map(AsRef::as_ref)
+		.chain(once(event_id))
+		.filter(|event_id| insert_path_filter(subgraph, waiters, ready, parked, event_id))
+		.map(ToOwned::to_owned);
 
-	(self, next_id, path)
+	outputs.extend(inserted);
+	self.marked = self.path.len();
 }
 
-#[implement(Local)]
-async fn push<Fetch, Fut, Pdu>(mut self, fetch: &Fetch, event_id: Option<OwnedEventId>) -> Self
-where
-	Fetch: Fn(OwnedEventId) -> Fut + Sync,
-	Fut: Future<Output = Result<Pdu>> + Send,
-	Pdu: Event,
-{
-	if let Some(event_id) = event_id
-		&& let Ok(event) = fetch(event_id).await
+fn insert_path_filter(
+	subgraph: &mut Subgraph,
+	waiters: &mut Waiters,
+	ready: &mut Ready,
+	parked: &mut usize,
+	event_id: &EventId,
+) -> bool {
+	let Some(state) = subgraph.get_mut(event_id) else {
+		subgraph.insert(event_id.to_owned(), Substate::Subgraph);
+		return true;
+	};
+
+	if matches!(*state, Substate::Subgraph) {
+		return false;
+	}
+
+	let pending = matches!(*state, Substate::Pending(_));
+
+	debug_assert!(
+		!matches!(*state, Substate::Dead),
+		"Dead node inserted into conflicted subgraph"
+	);
+
+	*state = Substate::Subgraph;
+
+	if pending
+		&& !waiters.is_empty()
+		&& let Some(locals) = waiters.remove(event_id)
 	{
-		self.stack
-			.push(event.auth_events_into().into_iter().collect());
+		debug_assert!(*parked >= locals.len(), "Invalid parked walker count");
+		*parked = parked.saturating_sub(locals.len());
+		ready.push(Wake {
+			event_id: event_id.to_owned(),
+			locals,
+			result: Resolution::Subgraph,
+		});
 	}
 
-	self
+	true
 }
 
-#[implement(Local)]
-fn pop(mut self) -> Option<(Self, OwnedEventId)> {
-	while self.stack.last().is_some_and(Frame::is_empty) {
-		self.stack.pop();
-		self.path.pop();
+fn complete_pending(context: &mut Context<'_>, event_id: OwnedEventId, result: Resolution) {
+	let Some(state) = context.subgraph.get_mut(&event_id) else {
+		return;
+	};
+
+	if !matches!(*state, Substate::Pending(_)) {
+		return;
 	}
 
-	self.stack
-		.last_mut()
-		.and_then(Frame::pop)
-		.inspect(|event_id| self.path.push(event_id.clone()))
-		.map(move |event_id| (self, event_id))
-}
+	*state = match result {
+		| Resolution::Dead => Substate::Dead,
+		| Resolution::Subgraph => Substate::Subgraph,
+	};
 
-#[implement(Local)]
-#[allow(clippy::redundant_clone)] // buggy, nursery
-fn new((id, conflicted_event_id): (usize, OwnedEventId)) -> Self {
-	Self {
-		id,
-		path: once(conflicted_event_id.clone()).collect(),
-		stack: once(once(conflicted_event_id).collect()).collect(),
-		..Default::default()
+	if context.waiters.is_empty() {
+		return;
 	}
+
+	let Some(locals) = context.waiters.remove(&event_id) else {
+		return;
+	};
+
+	debug_assert!(*context.parked >= locals.len(), "Invalid parked walker count");
+	*context.parked = context.parked.saturating_sub(locals.len());
+	context
+		.ready
+		.push(Wake { event_id, locals, result });
 }

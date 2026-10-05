@@ -11,7 +11,9 @@ use ruma::{
 };
 use tokio::sync::{RwLock, broadcast};
 use tuwunel_core::{
-	Result, Server, debug_info, trace,
+	Result, Server,
+	debug::INFO_SPAN_LEVEL,
+	debug_info, trace,
 	utils::{self, BoolExt, IterStream},
 };
 
@@ -44,6 +46,16 @@ impl crate::Service for Service {
 impl Service {
 	/// Sets a user as typing until the timeout timestamp is reached or
 	/// roomtyping_remove is called.
+	#[tracing::instrument(
+		name = "typing_start"
+		level = INFO_SPAN_LEVEL,
+		skip_all,
+		 fields(
+			%room_id,
+			%user_id,
+			%timeout,
+		)
+	)]
 	pub async fn typing_add(&self, user_id: &UserId, room_id: &RoomId, timeout: u64) -> Result {
 		debug_info!("typing started {user_id:?} in {room_id:?} timeout:{timeout:?}");
 
@@ -89,6 +101,15 @@ impl Service {
 	}
 
 	/// Removes a user from typing before the timeout is reached.
+	#[tracing::instrument(
+		name = "typing_stop"
+		level = INFO_SPAN_LEVEL,
+		skip_all,
+		 fields(
+			%room_id,
+			%user_id,
+		)
+	)]
 	pub async fn typing_remove(&self, user_id: &UserId, room_id: &RoomId) -> Result {
 		debug_info!("typing stopped {user_id:?} in {room_id:?}");
 

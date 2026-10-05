@@ -1,19 +1,19 @@
-use futures::future::join;
+use futures::future::join4;
 use ipaddress::IPAddress;
 use ruma::{
 	UInt, UserId,
 	api::{
 		client::push::{Pusher, PusherKind},
-		push_gateway::send_event_notification::{
-			self,
-			v1::{Device, Notification, NotificationCounts, NotificationPriority},
+		push_gateway::send_event_notification::v1::{
+			Device, Notification, NotificationCounts, NotificationPriority, Request,
 		},
 	},
 	events::TimelineEventType,
-	push::{Action, PushFormat, Ruleset, Tweak},
-	uint,
+	push::{Action, HttpPusherData, PushFormat, Ruleset, Tweak},
 };
-use tuwunel_core::{Err, Result, err, implement, matrix::Event};
+use serde_json::Value;
+use tuwunel_core::{Err, Result, err, implement, matrix::Event, utils::BoolExt, warn};
+use url::Url;
 
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip_all)]
@@ -62,39 +62,41 @@ where
 	}
 
 	if notify == Some(true) || self.services.config.push_everything {
-		// MSC3771/MSC3773: badge count merges main and per-thread notifications.
-		let (main, threads) = join(
-			self.services
-				.pusher
-				.notification_count(user_id, event.room_id()),
-			self.services
-				.pusher
-				.thread_notification_counts(user_id, event.room_id()),
-		)
-		.await;
-
-		let thread_total: u64 = threads
-			.values()
-			.map(|(notifications, _)| *notifications)
-			.sum();
-
-		let unread: UInt = main
-			.saturating_add(thread_total)
-			.try_into()
-			.unwrap_or_else(|_| uint!(1));
-
-		self.send_notice(unread, pusher, tweaks, event)
+		self.send_notice(user_id, pusher, tweaks, event)
 			.await?;
 	}
 
 	Ok(())
 }
 
+/// Send an account-wide counts-only notification to a push gateway.
+///
+/// Enabled HTTP pushers emit the request, including an explicit zero.
+#[implement(super::Service)]
+#[tracing::instrument(level = "debug", skip_all)]
+pub async fn send_badge_notice(&self, user_id: &UserId, pusher: &Pusher) -> Result {
+	let PusherKind::Http(http) = &pusher.kind else {
+		return Ok(());
+	};
+
+	if badge_count_disabled(http) {
+		return Ok(());
+	}
+
+	let device = self.prepare_http_pusher(pusher, http)?;
+	let unread = UInt::new(self.global_notification_count(user_id).await).unwrap_or(UInt::MAX);
+	let mut notify = Notification::new(vec![device]);
+	notify.counts = NotificationCounts::new_explicit(Some(unread), None);
+
+	self.send_http_notice(user_id, pusher, http, notify)
+		.await
+}
+
 #[implement(super::Service)]
 #[tracing::instrument(level = "debug", skip_all)]
 async fn send_notice<Pdu: Event>(
 	&self,
-	unread: UInt,
+	user_id: &UserId,
 	pusher: &Pusher,
 	tweaks: Vec<Tweak>,
 	event: &Pdu,
@@ -102,36 +104,10 @@ async fn send_notice<Pdu: Event>(
 	// TODO: email
 	match &pusher.kind {
 		| PusherKind::Http(http) => {
-			let url = &http.url;
-			let url = url::Url::parse(&http.url).map_err(|e| {
-				err!(Request(InvalidParam(
-					warn!(%url, "HTTP pusher URL is not a valid URL: {e}")
-				)))
-			})?;
-
-			if ["http", "https"]
-				.iter()
-				.all(|&scheme| !scheme.eq_ignore_ascii_case(url.scheme()))
-			{
-				return Err!(Request(InvalidParam(
-					warn!(%url, "HTTP pusher URL is not a valid HTTP/HTTPS URL")
-				)));
-			}
-
-			if let Ok(ip) = IPAddress::parse(url.host_str().expect("URL previously validated"))
-				&& !self.services.client.valid_cidr_range(&ip)
-			{
-				return Err!(Request(InvalidParam(
-					warn!(%url, "HTTP pusher URL is a forbidden remote address")
-				)));
-			}
+			let mut device = self.prepare_http_pusher(pusher, http)?;
 
 			// TODO (timo): can pusher/devices have conflicting formats
 			let event_id_only = http.format == Some(PushFormat::EventIdOnly);
-
-			let mut device = Device::new(pusher.ids.app_id.clone(), pusher.ids.pushkey.clone());
-			device.data.data.clone_from(&http.data);
-			device.data.format.clone_from(&http.format);
 
 			// Tweaks are only added if the format is NOT event_id_only
 			if !event_id_only {
@@ -143,19 +119,14 @@ async fn send_notice<Pdu: Event>(
 
 			notify.event_id = Some(event.event_id().to_owned());
 			notify.room_id = Some(event.room_id().to_owned());
-			if http
-				.data
-				.get("org.matrix.msc4076.disable_badge_count")
-				.is_none() && http.data.get("disable_badge_count").is_none()
-			{
-				notify.counts = NotificationCounts::new(unread, uint!(0));
-			} else {
-				// counts will not be serialised if it's the default (0, 0)
-				// skip_serializing_if = "NotificationCounts::is_default"
-				notify.counts = NotificationCounts::default();
-			}
 
-			if !event_id_only {
+			let unread = badge_count_disabled(http)
+				.is_false()
+				.then_async(async || {
+					UInt::new(self.global_notification_count(user_id).await).unwrap_or(UInt::MAX)
+				});
+
+			let unread = if !event_id_only {
 				if *event.kind() == TimelineEventType::RoomEncrypted
 					|| tweaks.iter().any(|t| {
 						matches!(
@@ -176,35 +147,99 @@ async fn send_notice<Pdu: Event>(
 					notify.user_is_target = event.state_key() == Some(event.sender().as_str());
 				}
 
-				notify.sender_display_name = self
-					.services
-					.users
-					.displayname(event.sender())
-					.await
-					.ok();
+				let (display_name, room_name, room_alias, unread) = join4(
+					self.services.profile.displayname(event.sender()),
+					self.services
+						.state_accessor
+						.get_name(event.room_id()),
+					self.services
+						.state_accessor
+						.get_canonical_alias(event.room_id()),
+					unread,
+				)
+				.await;
 
-				notify.room_name = self
-					.services
-					.state_accessor
-					.get_name(event.room_id())
-					.await
-					.ok();
+				notify.sender_display_name = display_name.ok();
+				notify.room_name = room_name.ok();
+				notify.room_alias = room_alias.ok();
 
-				notify.room_alias = self
-					.services
-					.state_accessor
-					.get_canonical_alias(event.room_id())
-					.await
-					.ok();
+				unread
+			} else {
+				unread.await
+			};
+
+			if let Some(unread) = unread {
+				notify.counts = NotificationCounts::new_explicit(Some(unread), None);
 			}
 
-			self.send_request(&http.url, send_event_notification::v1::Request::new(notify))
-				.await?;
-
-			Ok(())
+			self.send_http_notice(user_id, pusher, http, notify)
+				.await
 		},
 		// TODO: Handle email
 		//PusherKind::Email(_) => Ok(()),
 		| _ => Ok(()),
 	}
+}
+
+#[implement(super::Service)]
+fn prepare_http_pusher(&self, pusher: &Pusher, http: &HttpPusherData) -> Result<Device> {
+	let address = &http.url;
+	let url = Url::parse(address).map_err(|e| {
+		err!(Request(InvalidParam(
+			warn!(url = %address, error = %e, "HTTP pusher URL is not a valid URL")
+		)))
+	})?;
+
+	if ["http", "https"]
+		.iter()
+		.all(|&scheme| !scheme.eq_ignore_ascii_case(url.scheme()))
+	{
+		return Err!(Request(InvalidParam(
+			warn!(%url, "HTTP pusher URL is not a valid HTTP/HTTPS URL")
+		)));
+	}
+
+	let host = url.host_str().expect("URL previously validated");
+	if let Ok(ip) = IPAddress::parse(host)
+		&& !self.services.client.valid_cidr_range(&ip)
+	{
+		return Err!(Request(InvalidParam(
+			warn!(%url, "HTTP pusher URL is a forbidden remote address")
+		)));
+	}
+
+	let mut device = Device::new(pusher.ids.app_id.clone(), pusher.ids.pushkey.clone());
+	device.data.data.clone_from(&http.data);
+	device.data.format.clone_from(&http.format);
+
+	Ok(device)
+}
+
+#[implement(super::Service)]
+#[tracing::instrument(level = "debug", skip_all)]
+async fn send_http_notice(
+	&self,
+	user_id: &UserId,
+	pusher: &Pusher,
+	http: &HttpPusherData,
+	notify: Notification,
+) -> Result {
+	let response = self
+		.send_request(&http.url, Request::new(notify))
+		.await?;
+
+	if response.rejected.contains(&pusher.ids.pushkey) {
+		let pushkey = &pusher.ids.pushkey;
+
+		warn!(url = %http.url, %pushkey, "Push gateway rejected the pushkey; removing pusher");
+		self.delete_pusher(user_id, pushkey).await;
+	}
+
+	Ok(())
+}
+
+fn badge_count_disabled(http: &HttpPusherData) -> bool {
+	["org.matrix.msc4076.disable_badge_count", "disable_badge_count"]
+		.iter()
+		.any(|key| http.data.get(*key).and_then(Value::as_bool) == Some(true))
 }

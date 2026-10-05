@@ -19,7 +19,10 @@ name = "tuwunel"
 maintainer = "Jason Volk <jason@zemos.net>"
 copyright = "2025, Tuwunel Contributors"
 license-file = ["../../LICENSE", "3"]
-depends = "$auto, ca-certificates"
+# procps owns /usr/bin/kill, which the unit's ExecReload= invokes. It is only
+# Priority: important, so a trimmed install would not otherwise carry it.
+depends = "$auto, ca-certificates, adduser, procps"
+conflicts = "conduwuit"
 extended-description = """\
 High performance Matrix homeserver written in Rust"""
 section = "net"
@@ -32,6 +35,11 @@ assets = [
 	["../../README.md", "usr/share/doc/tuwunel/", "644"],
 	["target/release/tuwunel", "usr/sbin/tuwunel", "755"],
 	["../../tuwunel-example.toml", "etc/tuwunel/tuwunel.toml", "640"],
+	# Socket activation stays opt-in. cargo-deb enables the units it finds
+	# beside tuwunel.service or installed into lib/systemd/system, so this one
+	# lives outside both while landing in a vendor directory systemd reads all
+	# the same. Moving either path back would enable it on every install.
+	["../../debian/units/tuwunel.socket", "usr/lib/systemd/system/tuwunel.socket", "644"],
 ]
 
 [package.metadata.generate-rpm]
@@ -45,6 +53,7 @@ assets = [
 	{ source = "README.md", dest = "/usr/share/doc/tuwunel/", mode = "644", doc = true },
 	{ source = "tuwunel-example.toml", dest = "/etc/tuwunel/tuwunel.toml", mode = "640", config = "noreplace", user = "tuwunel", group = "tuwunel" },
 	{ source = "rpm/tuwunel.service", dest = "/etc/systemd/system/", mode = "644" },
+	{ source = "rpm/tuwunel.socket", dest = "/etc/systemd/system/", mode = "644" },
 	{ source = "rpm/sysusers", dest = "/usr/lib/sysusers.d/tuwunel.conf", mode = "644" },
 ]
 
@@ -154,10 +163,10 @@ perf_measurements = [
 # increases performance, reduces build times, and reduces binary size by not compiling or
 # genreating code for log level filters that users will generally not use (debug and trace)
 release_max_log_level = [
-	"tracing/max_level_trace",
-	"tracing/release_max_level_info",
 	"log/max_level_trace",
 	"log/release_max_level_info",
+	"tracing/max_level_trace",
+	"tracing/release_max_level_info",
 	"tuwunel-admin/release_max_log_level",
 	"tuwunel-api/release_max_log_level",
 	"tuwunel-core/release_max_log_level",
@@ -166,20 +175,24 @@ release_max_log_level = [
 	"tuwunel-service/release_max_log_level",
 ]
 sentry_telemetry = [
-	"dep:sentry",
-	"dep:sentry-tracing",
-	"dep:sentry-tower",
 	"dep:reqwest",
+	"dep:sentry",
+	"dep:sentry-tower",
+	"dep:sentry-tracing",
 	"tuwunel-core/sentry_telemetry",
 	"tuwunel-router/sentry_telemetry",
 ]
 systemd = [
 	"tuwunel-router/systemd",
+	"tuwunel-service/systemd",
 ]
 # enable the tokio_console server ncompatible with release_max_log_level
 tokio_console = [
 	"dep:console-subscriber",
 	"tokio/tracing",
+]
+tuwunel_mods = [
+	"tuwunel-core/tuwunel_mods",
 ]
 url_preview = [
 	"tuwunel-service/url_preview",
@@ -191,9 +204,6 @@ zstd_compression = [
 	"tuwunel-database/zstd_compression",
 	"tuwunel-router/zstd_compression",
 	"tuwunel-service/zstd_compression",
-]
-tuwunel_mods = [
-	"tuwunel-core/tuwunel_mods",
 ]
 
 [dependencies]
@@ -237,10 +247,18 @@ tracing-subscriber.workspace = true
 tracing.workspace = true
 webpki-root-certs.workspace = true
 
+# tokio hard-errors on this feature without the cfg, so it tracks the same gate
+# as the code enabling the histogram.
+[target.'cfg(tokio_unstable)'.dependencies.tokio]
+features = ["schedule-latency"]
+workspace = true
+
 [dev-dependencies]
 criterion.workspace = true
+futures.workspace = true
 insta.workspace = true
 maplit.workspace = true
+serde_json.workspace = true
 similar.workspace = true
 
 [lints]

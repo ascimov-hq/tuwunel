@@ -1,19 +1,23 @@
 mod data;
 mod dest;
 mod sender;
+#[cfg(test)]
+mod tests;
 
 use std::{
 	fmt::Debug,
 	hash::{DefaultHasher, Hash, Hasher},
 	io::Write,
-	iter::once,
+	iter::{once, repeat_with},
 	pin::pin,
 	sync::Arc,
 };
 
 use async_trait::async_trait;
 use futures::{FutureExt, Stream, StreamExt};
-use ruma::{RoomId, ServerName, UserId};
+use loole::unbounded;
+use ruma::{DeviceId, OwnedRoomId, RoomId, ServerName, UserId};
+use serde::Serialize;
 use tokio::{task, task::JoinSet};
 use tuwunel_core::{
 	Result, Server, debug, debug_warn, err, error,
@@ -25,12 +29,12 @@ use tuwunel_core::{
 	warn,
 };
 
-use self::data::Data;
 pub use self::{
+	data::Data,
 	dest::Destination,
 	sender::{EDU_LIMIT, PDU_LIMIT},
 };
-use crate::rooms::timeline::RawPduId;
+use crate::{appservice::RegistrationInfo, rooms::timeline::RawPduId};
 
 pub struct Service {
 	pub db: Data,
@@ -49,9 +53,15 @@ struct Msg {
 #[expect(clippy::module_name_repetitions)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SendingEvent {
-	Pdu(RawPduId), // pduid
-	Edu(EduBuf),   // edu json
-	Flush,         // none
+	Pdu(RawPduId),             // pduid
+	Edu(EduBuf),               // edu json
+	ToDevice(EduBuf),          // msc4203 to-device
+	DeviceListChanged(EduBuf), // msc3202 device list
+	/// Queue an account-wide counts-only push.
+	///
+	/// The sender recomputes the count when the row is delivered.
+	BadgeRefresh,
+	Flush, // none
 }
 
 pub type EduBuf = SmallVec<[u8; EDU_BUF_CAP]>;
@@ -59,6 +69,41 @@ pub type EduVec = SmallVec<[EduBuf; EDU_VEC_CAP]>;
 
 const EDU_BUF_CAP: usize = 128 - 16;
 const EDU_VEC_CAP: usize = 1;
+
+// Leading bytes on queued sending values select tagged event variants. Legacy
+// PDU and EDU rows cannot collide; the badge tag stands alone.
+const TAG_TO_DEVICE: u8 = 0x01;
+const TAG_DEVICE_LIST_CHANGED: u8 = 0x02;
+const TAG_BADGE_REFRESH: u8 = 0x03;
+const TAG_PREFIX_LEN: usize = 1 + size_of::<u64>();
+
+impl SendingEvent {
+	/// Return bytes written verbatim as the queue row value.
+	///
+	/// PDUs keep their ID in the row key and flushes are not persisted. EDU
+	/// variants own `[tag][count][body]`; a badge refresh owns only its tag.
+	pub(super) fn value_bytes(&self) -> &[u8] {
+		match self {
+			| Self::Edu(bytes) | Self::ToDevice(bytes) | Self::DeviceListChanged(bytes) => bytes,
+			| Self::BadgeRefresh => &[TAG_BADGE_REFRESH],
+			| Self::Pdu(_) | Self::Flush => &[],
+		}
+	}
+}
+
+/// Wire shape of one `de.sorunome.msc2409.to_device` entry (MSC4203): the
+/// stored to-device event flattened with the recipient's identifiers. The
+/// ruma `AnyAppserviceToDeviceEvent` deliberately has no `Serialize`, so the
+/// send side writes this local struct.
+#[derive(Serialize)]
+struct AsToDeviceEvent<'a> {
+	#[serde(rename = "type")]
+	kind: &'a str,
+	sender: &'a UserId,
+	content: &'a serde_json::Value,
+	to_user_id: &'a UserId,
+	to_device_id: &'a DeviceId,
+}
 
 #[async_trait]
 impl crate::Service for Service {
@@ -68,9 +113,7 @@ impl crate::Service for Service {
 			db: Data::new(args),
 			server: args.server.clone(),
 			services: args.services.clone(),
-			channels: (0..num_senders)
-				.map(|_| loole::unbounded())
-				.collect(),
+			channels: repeat_with(unbounded).take(num_senders).collect(),
 		}))
 	}
 
@@ -126,6 +169,12 @@ impl Service {
 		let dest = Destination::Push(user.to_owned(), pushkey);
 		let event = SendingEvent::Pdu(*pdu_id);
 		let _cork = self.db.db.cork();
+
+		self.queue_and_dispatch(dest, event)
+	}
+
+	/// Queue one event for delivery to `dest` and wake a sender.
+	fn queue_and_dispatch(&self, dest: Destination, event: SendingEvent) -> Result {
 		let keys = self.db.queue_requests(once((&event, &dest)));
 
 		self.dispatch(Msg {
@@ -138,21 +187,30 @@ impl Service {
 		})
 	}
 
+	/// Queue a counts-only push refresh for every pusher owned by a user.
+	///
+	/// Rows are durable, coalesced, and recomputed at send time.
+	#[tracing::instrument(level = "debug", skip(self))]
+	pub async fn refresh_push_badge(&self, user_id: &UserId) -> Result {
+		self.services
+			.pusher
+			.get_pushkeys(user_id)
+			.map(Ok)
+			.ready_try_for_each(|pushkey| {
+				let dest = Destination::Push(user_id.to_owned(), pushkey.to_owned());
+
+				self.queue_and_dispatch(dest, SendingEvent::BadgeRefresh)
+			})
+			.await
+	}
+
 	#[tracing::instrument(skip(self), level = "debug")]
 	pub fn send_pdu_appservice(&self, appservice_id: String, pdu_id: RawPduId) -> Result {
 		let dest = Destination::Appservice(appservice_id);
 		let event = SendingEvent::Pdu(pdu_id);
 		let _cork = self.db.db.cork();
-		let keys = self.db.queue_requests(once((&event, &dest)));
 
-		self.dispatch(Msg {
-			dest,
-			event,
-			queue_id: keys
-				.into_iter()
-				.next()
-				.expect("request queue key"),
-		})
+		self.queue_and_dispatch(dest, event)
 	}
 
 	#[tracing::instrument(skip(self, room_id, pdu_id), level = "debug")]
@@ -195,16 +253,8 @@ impl Service {
 		let dest = Destination::Federation(server.to_owned());
 		let event = SendingEvent::Edu(serialized);
 		let _cork = self.db.db.cork();
-		let keys = self.db.queue_requests(once((&event, &dest)));
 
-		self.dispatch(Msg {
-			dest,
-			event,
-			queue_id: keys
-				.into_iter()
-				.next()
-				.expect("request queue key"),
-		})
+		self.queue_and_dispatch(dest, event)
 	}
 
 	#[tracing::instrument(skip(self, room_id, serialized), level = "debug")]
@@ -224,21 +274,16 @@ impl Service {
 		let dest = Destination::Appservice(appservice_id);
 		let event = SendingEvent::Edu(serialized);
 		let _cork = self.db.db.cork();
-		let keys = self.db.queue_requests(once((&event, &dest)));
 
-		self.dispatch(Msg {
-			dest,
-			event,
-			queue_id: keys
-				.into_iter()
-				.next()
-				.expect("request queue key"),
-		})
+		self.queue_and_dispatch(dest, event)
 	}
 
 	/// Sends an EDU to all appservices interested in a room.
 	/// The `serialized` data must be in `EphemeralData` format, not federation
 	/// `Edu`.
+	// Stream::filter requires FnMut returning a nameable future; an async
+	// closure capturing self does not satisfy it.
+	#[expect(closure_returning_async_block)]
 	#[tracing::instrument(skip(self, serializer), level = "debug")]
 	pub async fn send_edu_room_appservices<'a, F>(
 		&self,
@@ -255,7 +300,7 @@ impl Service {
 			.await
 			.values()
 			.stream()
-			.filter(|&appservice| async {
+			.filter(|&appservice| async move {
 				if !appservice.registration.receive_ephemeral {
 					return false;
 				}
@@ -289,6 +334,126 @@ impl Service {
 					.ok();
 
 				Ok(())
+			})
+			.await
+	}
+
+	/// Queue stored to-device events for delivery to interested appservices
+	/// (MSC4203). `deliveries` are the concrete recipient devices already
+	/// written to the inbox (post-`AllDevices` expansion) paired with their
+	/// inbox counts, which uniquify the transaction hash.
+	#[tracing::instrument(
+		skip(self, deliveries, content),
+		level = "debug",
+		fields(
+			%target_user,
+		),
+	)]
+	pub async fn send_to_device_appservices<'a, I>(
+		&self,
+		sender: &UserId,
+		target_user: &UserId,
+		deliveries: I,
+		event_type: &str,
+		content: &serde_json::Value,
+	) -> Result
+	where
+		I: Iterator<Item = (&'a DeviceId, u64)> + Clone + Send,
+	{
+		let registrations = self.services.appservice.read().await;
+		let _cork = self.db.db.cork();
+
+		let mut payloads: Option<EduVec> = None;
+		for info in registrations.values() {
+			if !info.is_user_match(target_user) {
+				continue;
+			}
+
+			let payloads = payloads.get_or_insert_with(|| {
+				to_device_payloads(sender, target_user, deliveries.clone(), event_type, content)
+			});
+
+			for buf in &*payloads {
+				let dest = Destination::Appservice(info.registration.id.clone());
+				let event = SendingEvent::ToDevice(buf.clone());
+
+				self.queue_and_dispatch(dest, event)?;
+			}
+		}
+
+		Ok(())
+	}
+
+	/// Queue a `device_lists.changed` marker (MSC3202) for delivery to
+	/// appservices that opted into transaction extensions and are interested
+	/// in `user_id`. Called from `mark_device_key_update`, reusing the count it
+	/// already allocated so the marker uniquifies the transaction hash.
+	#[tracing::instrument(
+		skip(self),
+		level = "debug",
+		fields(
+			%user_id,
+		),
+	)]
+	pub async fn send_device_list_appservices(&self, user_id: &UserId, count: u64) -> Result {
+		let registrations = self.services.appservice.read().await;
+
+		// Hot path: no bridge opted into transaction extensions.
+		if !registrations
+			.values()
+			.any(|info| info.registration.msc3202_transaction_extensions)
+		{
+			return Ok(());
+		}
+
+		let _cork = self.db.db.cork();
+
+		let mut payload = None;
+		for info in registrations.values() {
+			if !info.registration.msc3202_transaction_extensions {
+				continue;
+			}
+
+			if !info.is_user_match(user_id) && !self.shares_device_list_room(user_id, info).await
+			{
+				continue;
+			}
+
+			let payload = payload.get_or_insert_with(|| device_list_payload(user_id, count));
+
+			let dest = Destination::Appservice(info.registration.id.clone());
+			let event = SendingEvent::DeviceListChanged(payload.clone());
+
+			self.queue_and_dispatch(dest, event)?;
+		}
+
+		Ok(())
+	}
+
+	/// Whether `user_id` shares a device-list-interesting room with `info`: a
+	/// joined room the appservice participates in that is encrypted, or any
+	/// such room when `device_key_update_encrypted_rooms_only` is off.
+	async fn shares_device_list_room(&self, user_id: &UserId, info: &RegistrationInfo) -> bool {
+		let update_all_rooms = !self
+			.services
+			.config
+			.device_key_update_encrypted_rooms_only;
+
+		self.services
+			.state_cache
+			.rooms_joined(user_id)
+			.map(ToOwned::to_owned)
+			.any(async |room_id: OwnedRoomId| {
+				(update_all_rooms
+					|| self
+						.services
+						.state_accessor
+						.is_encrypted_room(&room_id)
+						.await) && self
+					.services
+					.state_cache
+					.appservice_in_room(&room_id, info)
+					.await
 			})
 			.await
 	}
@@ -348,6 +513,45 @@ impl Service {
 				})
 			})
 			.await
+	}
+
+	#[tracing::instrument(skip(self), level = "debug")]
+	pub fn flush_appservice(&self, appservice_id: String) -> Result {
+		self.dispatch(Msg {
+			dest: Destination::Appservice(appservice_id),
+			event: SendingEvent::Flush,
+			queue_id: Vec::<u8>::new(),
+		})
+	}
+
+	/// Flushes the sender for a federation peer that has proven reachable via
+	/// inbound activity or an operator reset, but only when it was actually in
+	/// its failure bucket; reports whether it was.
+	#[tracing::instrument(
+		level = "debug",
+		skip(self),
+		fields(
+			%server,
+		),
+	)]
+	pub async fn notify_peer_alive(&self, server: &ServerName) -> bool {
+		let sad = self
+			.services
+			.federation
+			.note_peer_alive(server)
+			.await;
+
+		if sad {
+			self.dispatch(Msg {
+				dest: Destination::Federation(server.to_owned()),
+				event: SendingEvent::Flush,
+				queue_id: Vec::<u8>::new(),
+			})
+			.log_err()
+			.ok();
+		}
+
+		sad
 	}
 
 	/// Clean up queued sending event data
@@ -413,6 +617,47 @@ impl Service {
 		let chans = self.channels.len().max(1);
 		hash.overflowing_rem(chans).0
 	}
+}
+
+fn to_device_payloads<'a, I>(
+	sender: &UserId,
+	target_user: &UserId,
+	deliveries: I,
+	event_type: &str,
+	content: &serde_json::Value,
+) -> EduVec
+where
+	I: Iterator<Item = (&'a DeviceId, u64)>,
+{
+	deliveries
+		.map(|(to_device_id, count)| {
+			let mut buf = EduBuf::new();
+			buf.push(TAG_TO_DEVICE);
+			buf.extend_from_slice(&count.to_be_bytes());
+
+			let event = AsToDeviceEvent {
+				kind: event_type,
+				sender,
+				content,
+				to_user_id: target_user,
+				to_device_id,
+			};
+
+			serde_json::to_writer(&mut buf, &event)
+				.expect("to-device appservice event serializes");
+
+			buf
+		})
+		.collect()
+}
+
+fn device_list_payload(user_id: &UserId, count: u64) -> EduBuf {
+	let mut buf = EduBuf::new();
+	buf.push(TAG_DEVICE_LIST_CHANGED);
+	buf.extend_from_slice(&count.to_be_bytes());
+	buf.extend_from_slice(user_id.as_bytes());
+
+	buf
 }
 
 fn num_senders(args: &crate::Args<'_>) -> usize {

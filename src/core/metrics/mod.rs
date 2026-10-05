@@ -1,14 +1,32 @@
 pub mod dump;
 
 use std::sync::{
-	Arc,
+	Arc, Mutex,
 	atomic::{AtomicU32, AtomicU64},
 };
+#[cfg(tokio_unstable)]
+use std::{iter::repeat, ops::Range, time::Duration};
 
+#[cfg(tokio_unstable)]
+use smallvec::SmallVec;
 use tokio::runtime;
 #[cfg(tokio_unstable)]
 use tokio_metrics::{RuntimeIntervals, RuntimeMonitor};
 use tokio_metrics::{TaskMetrics, TaskMonitor};
+
+/// Bucket counts sampled from the scheduler latency histogram.
+///
+/// The inline budget matches the default bucket count; a runtime configured
+/// with more buckets spills to the heap.
+#[cfg(tokio_unstable)]
+type Counts = SmallVec<[u64; 20]>;
+
+/// One bucket of the scheduler latency histogram.
+///
+/// The range is the bucket's latency span as configured on the runtime; the
+/// count is how many task schedules landed within it.
+#[cfg(tokio_unstable)]
+type Bucket = (Range<Duration>, u64);
 
 pub struct Metrics {
 	_runtime: Option<runtime::Handle>,
@@ -17,13 +35,16 @@ pub struct Metrics {
 
 	task_monitor: Option<TaskMonitor>,
 
-	task_intervals: std::sync::Mutex<Option<Box<dyn Iterator<Item = TaskMetrics> + Send>>>,
+	task_intervals: Mutex<Option<Box<dyn Iterator<Item = TaskMetrics> + Send>>>,
 
 	#[cfg(tokio_unstable)]
 	_runtime_monitor: Option<RuntimeMonitor>,
 
 	#[cfg(tokio_unstable)]
-	runtime_intervals: std::sync::Mutex<Option<RuntimeIntervals>>,
+	runtime_intervals: Mutex<Option<RuntimeIntervals>>,
+
+	#[cfg(tokio_unstable)]
+	sched_histogram_last: Mutex<Counts>,
 
 	// TODO: move stats
 	pub requests_count: AtomicU64,
@@ -70,7 +91,10 @@ impl Metrics {
 			_runtime_monitor: runtime_monitor,
 
 			#[cfg(tokio_unstable)]
-			runtime_intervals: std::sync::Mutex::new(runtime_intervals),
+			runtime_intervals: Mutex::new(runtime_intervals),
+
+			#[cfg(tokio_unstable)]
+			sched_histogram_last: Counts::new().into(),
 
 			requests_count: AtomicU64::new(0),
 			requests_handle_finished: AtomicU64::new(0),
@@ -107,6 +131,43 @@ impl Metrics {
 			.as_mut()
 			.map(Iterator::next)
 			.expect("next interval")
+	}
+
+	/// Bucket deltas of the scheduler latency histogram since the last call.
+	///
+	/// Each call diffs the runtime's cumulative per-worker counts against the
+	/// previous sample and replaces it, so the counts are the traffic of one
+	/// interval rather than the totals tokio exposes. Returns `None` when the
+	/// runtime was built without the histogram.
+	#[cfg(tokio_unstable)]
+	pub fn sched_histogram_interval(&self) -> Option<impl Iterator<Item = Bucket>> {
+		let metrics = self
+			.runtime_metrics()
+			.filter(|metrics| metrics.schedule_latency_histogram_enabled())?;
+
+		let num_workers = metrics.num_workers();
+		let bucket_total = |bucket| -> u64 {
+			(0..num_workers)
+				.map(|worker| metrics.schedule_latency_histogram_bucket_count(worker, bucket))
+				.sum()
+		};
+
+		let num_buckets = metrics.schedule_latency_histogram_num_buckets();
+		let totals: Counts = (0..num_buckets).map(bucket_total).collect();
+
+		let mut last = self.sched_histogram_last.lock().expect("locked");
+		let deltas: Counts = totals
+			.iter()
+			.zip(last.iter().copied().chain(repeat(0)))
+			.map(|(total, last)| total.saturating_sub(last))
+			.collect();
+
+		*last = totals;
+
+		let ranges = (0..num_buckets)
+			.map(move |bucket| metrics.schedule_latency_histogram_bucket_range(bucket));
+
+		Some(ranges.zip(deltas))
 	}
 
 	#[inline]

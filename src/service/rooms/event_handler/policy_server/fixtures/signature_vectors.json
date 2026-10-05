@@ -1,0 +1,63 @@
+{
+  "via": "policy.example.org",
+  "public_key": "A6EHv/POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg",
+  "negative_event_id": "$SBMygfLmpmApTa7LYGSVWxt5uDEtQYARvB_d9CysX_A",
+  "vectors": [
+    {
+      "room_version": "11",
+      "signature": "AynAOxHA72aZYbs4Z4c95GmdxScj3+YiXMVR1mXODWuqrAdAZmxyC+YhHDRArmlTwRDtYK09JaCcEXIKJBg9Bg",
+      "pdu": {
+        "auth_events": ["$auth1", "$auth2"],
+        "content": {
+          "body": "hello world",
+          "msgtype": "m.text"
+        },
+        "depth": 5,
+        "hashes": {
+          "sha256": "thishashdoesnotmatterforsigningXXXXXXXXXXXX"
+        },
+        "origin_server_ts": 1784951466194,
+        "prev_events": ["$prev1"],
+        "room_id": "!room:example.org",
+        "sender": "@alice:origin.example.org",
+        "signatures": {
+          "origin.example.org": {
+            "ed25519:a_key": "AAAA"
+          }
+        },
+        "type": "m.room.message",
+        "unsigned": {
+          "age_ts": 1784951466194
+        }
+      }
+    },
+    {
+      "room_version": "12",
+      "signature": "d3m1x5FZ3lWIzi5OZL99A4HXi1oeXjuZI637IOwRTEqt0jP8Xg1B6Oj8/gluUYx8fsA3ixIVQBQdeAALlWx0Ag",
+      "pdu": {
+        "auth_events": ["$auth1", "$auth2"],
+        "content": {
+          "body": "hello world",
+          "msgtype": "m.text"
+        },
+        "depth": 5,
+        "hashes": {
+          "sha256": "thishashdoesnotmatterforsigningXXXXXXXXXXXX"
+        },
+        "origin_server_ts": 1784951466194,
+        "prev_events": ["$prev1"],
+        "room_id": "!L58ME6ufiP49v97UIOBIpvWKEgj4912JmECPuDzlvCI",
+        "sender": "@alice:origin.example.org",
+        "signatures": {
+          "origin.example.org": {
+            "ed25519:a_key": "AAAA"
+          }
+        },
+        "type": "m.room.message",
+        "unsigned": {
+          "age_ts": 1784951466194
+        }
+      }
+    }
+  ]
+}
