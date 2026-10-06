@@ -200,6 +200,30 @@ impl Service {
 			.any(|info| info.is_exclusive_user_match(user_id))
 	}
 
+	/// Checks if `appservice` may act as a local `user_id` in Beeper's batch
+	/// features: the user is in its own namespace, or in the namespace of one
+	/// of the configured `trusted_double_puppet_appservices`.
+	pub async fn can_act_as_user(&self, appservice: &RegistrationInfo, user_id: &UserId) -> bool {
+		if appservice.is_user_match(user_id) {
+			return true;
+		}
+
+		let trusted = &self
+			.services
+			.config
+			.trusted_double_puppet_appservices;
+
+		if trusted.is_empty() {
+			return false;
+		}
+
+		self.read()
+			.await
+			.iter()
+			.filter(|(id, _)| trusted.contains(id))
+			.any(|(_, info)| info.is_user_match(user_id))
+	}
+
 	/// Checks if a given room alias matches any exclusive appservice regex
 	pub async fn is_exclusive_alias(&self, alias: &RoomAliasId) -> bool {
 		self.read()

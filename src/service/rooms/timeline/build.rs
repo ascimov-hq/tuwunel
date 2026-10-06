@@ -29,10 +29,25 @@ use super::RoomMutexGuard;
 )]
 pub async fn build_and_append_pdu(
 	&self,
+	pdu_builder: PduBuilder,
+	sender: &UserId,
+	room_id: &RoomId,
+	state_lock: &RoomMutexGuard,
+) -> Result<OwnedEventId> {
+	self.build_and_append_pdu_with(pdu_builder, sender, room_id, state_lock, true)
+		.await
+}
+
+/// Like `build_and_append_pdu`, but push notifications are only sent when
+/// `notify` is true.
+#[implement(super::Service)]
+pub async fn build_and_append_pdu_with(
+	&self,
 	mut pdu_builder: PduBuilder,
 	sender: &UserId,
 	room_id: &RoomId,
 	state_lock: &RoomMutexGuard,
+	notify: bool,
 ) -> Result<OwnedEventId> {
 	if pdu_builder.event_type == TimelineEventType::RoomMember {
 		self.sanitize_member_authorisation(&mut pdu_builder, room_id)
@@ -105,13 +120,14 @@ pub async fn build_and_append_pdu(
 	let statehashid = self.services.state.append_to_state(&pdu).await?;
 
 	let pdu_id = self
-		.append_pdu(
+		.append_pdu_with(
 			&pdu,
 			pdu_json,
 			// Since this PDU references all pdu_leaves we can update the leaves
 			// of the room
 			once(pdu.event_id()),
 			state_lock,
+			notify,
 		)
 		.boxed()
 		.await?;

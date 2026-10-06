@@ -1,11 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use axum::extract::State;
 use futures::{FutureExt, StreamExt};
 use itertools::Itertools;
 use ruma::{
-	CanonicalJsonObject, EventEncryptionAlgorithm, Int, OwnedRoomAliasId, OwnedRoomId,
-	OwnedUserId, RoomAliasId, RoomId, RoomVersionId, UserId,
+	CanonicalJsonObject, CanonicalJsonValue, EventEncryptionAlgorithm, Int, OwnedRoomAliasId,
+	OwnedRoomId, OwnedUserId, RoomAliasId, RoomId, RoomVersionId, UserId,
 	api::client::room::{
 		self,
 		create_room::{
@@ -44,7 +44,9 @@ use tuwunel_core::{
 	utils::{BoolExt, IterStream, ReadyExt, option::OptionExt},
 	warn,
 };
-use tuwunel_service::{Services, appservice::RegistrationInfo, rooms::state::RoomMutexGuard};
+use tuwunel_service::{
+	Services, appservice::RegistrationInfo, rooms::state::RoomMutexGuard, users::Register,
+};
 
 use crate::{Ruma, client::utils::invite_check};
 
@@ -154,6 +156,11 @@ pub(crate) async fn create_room_route(
 		.boxed()
 		.await?;
 
+	// 8. Beeper autojoin invites: appservices can join their users directly
+	let auto_joined = apply_autojoin_pdus(&services, &body, sender_user, &room_id, &state_lock)
+		.boxed()
+		.await;
+
 	drop(next_count);
 	drop(state_lock);
 
@@ -163,7 +170,7 @@ pub(crate) async fn create_room_route(
 			.await
 			.is_ok()
 	{
-		process_invites(&services, &body, sender_user, &room_id)
+		process_invites(&services, &body, sender_user, &room_id, &auto_joined)
 			.boxed()
 			.await;
 	}
@@ -481,9 +488,17 @@ async fn process_invites(
 	body: &Ruma<create_room::v3::Request>,
 	sender_user: &UserId,
 	room_id: &RoomId,
+	auto_joined: &HashSet<OwnedUserId>,
 ) {
-	// 8. Events implied by invite (and TODO: invite_3pid)
-	body.invite
+	let invites: Vec<OwnedUserId> = body
+		.invite
+		.iter()
+		.filter(|&user_id| !auto_joined.contains(user_id))
+		.cloned()
+		.collect();
+
+	// 9. Events implied by invite (and TODO: invite_3pid)
+	invites
 		.iter()
 		.stream()
 		.filter(|&user_id| invite_allowed(services, sender_user, user_id))
@@ -498,6 +513,145 @@ async fn process_invites(
 			}
 		})
 		.await;
+}
+
+/// Beeper's `com.beeper.room_create_autojoin_invites`: when an appservice
+/// creates a room, users listed in `com.beeper.initial_members` (and in
+/// `invite` if `com.beeper.auto_join_invites` is set) are joined directly
+/// instead of being invited, so bridges don't need a join request per user.
+///
+/// Only local users the appservice can act as are joined: users in its own
+/// namespace or in a trusted double puppeting appservice's namespace. Missing
+/// users in its exclusive namespace (ghosts) are registered first. Everyone
+/// else falls back to a normal invite. Returns the users that were joined.
+async fn apply_autojoin_pdus(
+	services: &Services,
+	body: &Ruma<create_room::v3::Request>,
+	sender_user: &UserId,
+	room_id: &RoomId,
+	state_lock: &RoomMutexGuard,
+) -> HashSet<OwnedUserId> {
+	let mut joined = HashSet::new();
+	let Some(appservice_info) = body.appservice_info.as_ref() else {
+		return joined;
+	};
+
+	for user_id in autojoin_targets(body) {
+		if user_id == sender_user
+			|| !services.globals.user_is_local(&user_id)
+			|| !services
+				.appservice
+				.can_act_as_user(appservice_info, &user_id)
+				.await || !invite_allowed(services, sender_user, &user_id).await
+		{
+			continue;
+		}
+
+		match autojoin_user(services, body, sender_user, &user_id, room_id, state_lock)
+			.boxed()
+			.await
+		{
+			| Ok(()) => {
+				joined.insert(user_id);
+			},
+			| Err(e) => warn!(%e, %user_id, "Failed to auto-join user, inviting instead"),
+		}
+	}
+
+	joined
+}
+
+/// Users the request asks to be joined directly, in request order.
+fn autojoin_targets(body: &Ruma<create_room::v3::Request>) -> Vec<OwnedUserId> {
+	let Some(CanonicalJsonValue::Object(json)) = body.json_body.as_ref() else {
+		return Vec::new();
+	};
+
+	let auto_join_invites =
+		matches!(json.get("com.beeper.auto_join_invites"), Some(CanonicalJsonValue::Bool(true)));
+
+	let initial_members = match json.get("com.beeper.initial_members") {
+		| Some(CanonicalJsonValue::Array(members)) => members.as_slice(),
+		| _ => &[],
+	};
+
+	let initial_members = initial_members
+		.iter()
+		.filter_map(|member| match member {
+			| CanonicalJsonValue::String(user_id) => UserId::parse(user_id.as_str()).ok(),
+			| _ => None,
+		});
+
+	let invites = body
+		.invite
+		.iter()
+		.filter(|_| auto_join_invites)
+		.cloned();
+
+	initial_members.chain(invites).unique().collect()
+}
+
+async fn autojoin_user(
+	services: &Services,
+	body: &Ruma<create_room::v3::Request>,
+	sender_user: &UserId,
+	user_id: &UserId,
+	room_id: &RoomId,
+	state_lock: &RoomMutexGuard,
+) -> Result {
+	let appservice_info = body
+		.appservice_info
+		.as_ref()
+		.expect("autojoin is only done for appservices");
+
+	if !services.users.exists(user_id).await {
+		if !appservice_info.is_exclusive_user_match(user_id) {
+			return Err!(Request(NotFound("User {user_id} does not exist.")));
+		}
+
+		services
+			.users
+			.full_register(Register {
+				user_id: Some(user_id),
+				is_appservice: true,
+				..Default::default()
+			})
+			.await?;
+	}
+
+	let member_content = async |membership| RoomMemberEventContent {
+		displayname: services.users.displayname(user_id).await.ok(),
+		avatar_url: services.users.avatar_url(user_id).await.ok(),
+		blurhash: services.users.blurhash(user_id).await.ok(),
+		is_direct: Some(body.is_direct),
+		..RoomMemberEventContent::new(membership)
+	};
+
+	// Invite first: private rooms only let invited users join.
+	services
+		.timeline
+		.build_and_append_pdu(
+			PduBuilder::state(
+				user_id.to_string(),
+				&member_content(MembershipState::Invite).await,
+			),
+			sender_user,
+			room_id,
+			state_lock,
+		)
+		.await?;
+
+	services
+		.timeline
+		.build_and_append_pdu(
+			PduBuilder::state(user_id.to_string(), &member_content(MembershipState::Join).await),
+			user_id,
+			room_id,
+			state_lock,
+		)
+		.await?;
+
+	Ok(())
 }
 
 /// Gate an invitee against the sender's ignore list, the recipient's ignore
@@ -981,6 +1135,7 @@ impl From<InitialEvent> for PduBuilder {
 			state_key: Some(value.state_key),
 			redacts: None,
 			timestamp: None,
+			event_id_override: None,
 		}
 	}
 }

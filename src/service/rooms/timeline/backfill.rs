@@ -415,7 +415,7 @@ pub async fn backfill_pdu(
 }
 
 #[implement(super::Service)]
-fn prepend_backfill_pdu(
+pub(super) fn prepend_backfill_pdu(
 	&self,
 	pdu_id: &RawPduId,
 	room_id: &RoomId,
