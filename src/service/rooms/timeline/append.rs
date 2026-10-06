@@ -111,13 +111,31 @@ where
 /// cache, indexing, notification, and membership work is not part of that
 /// transaction, so an error can be returned after the event is stored.
 #[implement(super::Service)]
-#[tracing::instrument(name = "append", level = "debug", skip_all, ret(Debug))]
 pub async fn append_pdu<'a, Leafs>(
+	&'a self,
+	pdu: &'a PduEvent,
+	pdu_json: CanonicalJsonObject,
+	leafs: Leafs,
+	state_lock: &'a RoomMutexGuard,
+) -> Result<RawPduId>
+where
+	Leafs: Iterator<Item = &'a EventId> + Send + 'a,
+{
+	self.append_pdu_with(pdu, pdu_json, leafs, state_lock, true)
+		.await
+}
+
+/// Like `append_pdu`, but push notifications are only sent when `notify` is
+/// true.
+#[implement(super::Service)]
+#[tracing::instrument(name = "append", level = "debug", skip_all, ret(Debug))]
+pub async fn append_pdu_with<'a, Leafs>(
 	&'a self,
 	pdu: &'a PduEvent,
 	mut pdu_json: CanonicalJsonObject,
 	leafs: Leafs,
 	state_lock: &'a RoomMutexGuard,
+	notify: bool,
 ) -> Result<RawPduId>
 where
 	Leafs: Iterator<Item = &'a EventId> + Send + 'a,
@@ -232,12 +250,14 @@ where
 			.ok();
 	}
 
-	self.services
-		.pusher
-		.append_pdu(pdu_id, pdu)
-		.await
-		.log_err()
-		.ok();
+	if notify {
+		self.services
+			.pusher
+			.append_pdu(pdu_id, pdu)
+			.await
+			.log_err()
+			.ok();
+	}
 
 	self.append_pdu_effects(pdu_id, pdu, shortroomid, count, state_lock)
 		.await?;

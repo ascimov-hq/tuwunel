@@ -81,7 +81,7 @@ static VERSIONS: [&str; 27] = [
 	"v1.19",  /* mutual rooms (MSC2666) */
 ];
 
-static UNSTABLE_FEATURES: [&str; 42] = [
+static UNSTABLE_FEATURES: [&str; 44] = [
 	"org.matrix.e2e_cross_signing",
 	// private read receipts (https://github.com/matrix-org/matrix-spec-proposals/pull/2285)
 	"org.matrix.msc2285.stable",
@@ -159,6 +159,12 @@ static UNSTABLE_FEATURES: [&str; 42] = [
 	"org.matrix.msc3440.stable",
 	// state_after on /sync (https://github.com/matrix-org/matrix-spec-proposals/pull/4222)
 	"org.matrix.msc4222",
-	// Beeper room yeeting: full room purge on delete (POST .../com.beeper.yeet/rooms/{roomId}/delete)
+	// Beeper room yeeting: full room purge on delete (POST
+	// .../com.beeper.yeet/rooms/{roomId}/delete)
 	"com.beeper.room_yeeting",
+	// Beeper batch sending for bridge backfill (POST
+	// .../com.beeper.backfill/rooms/{roomId}/batch_send)
+	"com.beeper.batch_sending",
+	// Beeper autojoin invites: appservices join their users directly on createRoom
+	"com.beeper.room_create_autojoin_invites",
 ];

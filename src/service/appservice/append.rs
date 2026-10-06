@@ -63,6 +63,10 @@ async fn append_pdu_to(
 
 #[implement(super::Service)]
 async fn should_append_to(&self, appservice: &RegistrationInfo, pdu: &Pdu) -> bool {
+	if pdu.state_key.is_none() && appservice.is_exclusive_user_match(pdu.sender()) {
+		return false;
+	}
+
 	if self
 		.services
 		.state_cache

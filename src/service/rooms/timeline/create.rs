@@ -8,8 +8,8 @@ use std::cmp;
 
 use futures::{StreamExt, TryStreamExt};
 use ruma::{
-	CanonicalJsonObject, CanonicalJsonValue, MilliSecondsSinceUnixEpoch, OwnedRoomId, RoomId,
-	UserId,
+	CanonicalJsonObject, CanonicalJsonValue, MilliSecondsSinceUnixEpoch, OwnedEventId,
+	OwnedRoomId, RoomId, RoomVersionId, UserId,
 	events::{TimelineEventType, room::create::RoomCreateEventContent},
 	room_version_rules::RoomIdFormatVersion,
 	uint,
@@ -53,6 +53,7 @@ pub async fn create_hash_and_sign_event(
 		state_key,
 		redacts,
 		timestamp,
+		event_id_override,
 	} = pdu_builder;
 
 	let prev_events = self
@@ -177,10 +178,7 @@ pub async fn create_hash_and_sign_event(
 		pdu_json.remove("room_id");
 	}
 
-	pdu.event_id = self
-		.services
-		.server_keys
-		.gen_id_hash_and_sign_event(&mut pdu_json, &room_version)?;
+	pdu.event_id = self.gen_id_hash_and_sign(&mut pdu_json, &room_version, event_id_override)?;
 
 	// Room id is event id for V12+
 	if matches!(version_rules.room_id_format, RoomIdFormatVersion::V2)
@@ -220,4 +218,29 @@ async fn compute_prev_events(
 	}
 
 	Ok(prev_events)
+}
+
+/// Hashes and signs the event, returning its event ID. Appservice batch
+/// sending stores events under client-chosen IDs instead; the hashes and
+/// signatures then no longer match the ID, so callers only allow this in rooms
+/// which don't federate.
+#[implement(super::Service)]
+fn gen_id_hash_and_sign(
+	&self,
+	pdu_json: &mut CanonicalJsonObject,
+	room_version: &RoomVersionId,
+	event_id_override: Option<OwnedEventId>,
+) -> Result<OwnedEventId> {
+	let event_id = self
+		.services
+		.server_keys
+		.gen_id_hash_and_sign_event(pdu_json, room_version)?;
+
+	let Some(event_id) = event_id_override else {
+		return Ok(event_id);
+	};
+
+	pdu_json.insert("event_id".into(), CanonicalJsonValue::String(event_id.as_str().into()));
+
+	Ok(event_id)
 }

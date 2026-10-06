@@ -49,6 +49,11 @@ pub struct Builder {
 	/// An absent value uses the current time when the PDU is built. Ordinary
 	/// callers should leave this field unset.
 	pub timestamp: Option<MilliSecondsSinceUnixEpoch>,
+
+	/// Store the event under this ID instead of its reference hash. Only for
+	/// appservice batch sending into rooms that don't federate.
+	#[serde(skip)]
+	pub event_id_override: Option<OwnedEventId>,
 }
 
 impl Default for Builder {
@@ -60,6 +65,7 @@ impl Default for Builder {
 			state_key: None,
 			redacts: None,
 			timestamp: None,
+			event_id_override: None,
 		}
 	}
 }
@@ -127,6 +133,10 @@ impl fmt::Debug for Builder {
 
 		if let Some(timestamp) = self.timestamp.as_ref() {
 			d.field("ts", timestamp);
+		}
+
+		if let Some(event_id) = self.event_id_override.as_ref() {
+			d.field("event_id", event_id);
 		}
 
 		if let Some(unsigned) = self.unsigned.as_ref() {

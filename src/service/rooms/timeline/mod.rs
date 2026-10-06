@@ -6,6 +6,7 @@
 
 mod append;
 mod backfill;
+mod batch;
 mod build;
 mod create;
 mod pdus;
