@@ -3,22 +3,36 @@ use std::collections::{BTreeMap, HashSet};
 use axum::extract::State;
 use futures::{StreamExt, pin_mut};
 use ruma::{
-	EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId, UserId,
-	api::client::tuwunel::batch_send::unstable as batch_send,
+	EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, OwnedUserId, RoomId, UserId,
+	api::{client::tuwunel::batch_send::unstable as batch_send, error::ErrorKind},
 	events::{
-		RoomAccountDataEventType,
+		RoomAccountDataEventType, TimelineEventType,
 		fully_read::{FullyReadEvent, FullyReadEventContent},
+		reaction::ReactionEventContent,
 		receipt::{Receipt, ReceiptEvent, ReceiptEventContent, ReceiptThread, ReceiptType},
+		room::{
+			encrypted::Relation, member::MembershipState, redaction::RoomRedactionEventContent,
+		},
 	},
 };
+use serde::Deserialize;
 use tuwunel_core::{
-	Err, Result, err,
-	matrix::{event::Event, pdu::PduBuilder},
+	Err, Error, Result, err,
+	matrix::{
+		event::Event,
+		pdu::{PduBuilder, PduEvent},
+	},
 	warn,
 };
-use tuwunel_service::Services;
+use tuwunel_service::{Services, appservice::RegistrationInfo};
 
 use crate::Ruma;
+
+#[derive(Deserialize)]
+struct ExtractRelatesTo {
+	#[serde(rename = "m.relates_to")]
+	relates_to: Relation,
+}
 
 /// # `POST /_matrix/client/unstable/com.beeper.backfill/rooms/{roomId}/batch_send`
 ///
@@ -62,12 +76,6 @@ pub(crate) async fn batch_send_route(
 		)));
 	}
 
-	if let Some(user_id) = &body.mark_read_by
-		&& !services.globals.user_is_local(user_id)
-	{
-		return Err!(Request(InvalidParam("mark_read_by must be a local user.")));
-	}
-
 	for event in &body.events {
 		if event.state_key.is_some() {
 			return Err!(Request(InvalidParam("State events can't be batch sent.")));
@@ -85,30 +93,39 @@ pub(crate) async fn batch_send_route(
 			)));
 		}
 
-		if !services
+		if services
 			.state_cache
-			.is_joined(sender, room_id)
+			.user_membership(sender, room_id)
 			.await
+			.is_some_and(|membership| membership == MembershipState::Ban)
 		{
-			return Err!(Request(Forbidden("Sender {sender} is not joined to the room.")));
+			return Err!(Request(Forbidden("Sender {sender} is banned from the room.")));
 		}
 	}
 
 	let state_lock = services.state.mutex.lock(room_id).await;
 
-	let forward =
-		body.forward || (body.forward_if_no_messages && !has_messages(&services, room_id).await);
+	let batch_ids: HashSet<&EventId> = body
+		.events
+		.iter()
+		.filter_map(|event| event.event_id.as_deref())
+		.collect();
+
+	let forward = body.forward
+		|| (body.forward_if_no_messages && !has_messages(&services, room_id, &batch_ids).await);
 
 	let build = |event: &batch_send::BatchSendEvent| PduBuilder {
 		event_type: event.event_type.clone(),
 		content: event.content.clone().into(),
 		timestamp: Some(event.origin_server_ts),
 		event_id_override: event.event_id.clone(),
+		assume_sender_joined: true,
 		..Default::default()
 	};
 
 	let mut event_ids: Vec<OwnedEventId> = Vec::with_capacity(body.events.len());
 	let mut written: HashSet<OwnedEventId> = HashSet::new();
+	let mut reactions: HashSet<(OwnedUserId, OwnedEventId, String)> = HashSet::new();
 	if forward {
 		for event in &body.events {
 			if let Some(event_id) = existing_event_id(&services, room_id, event, &written).await?
@@ -117,7 +134,14 @@ pub(crate) async fn batch_send_route(
 				continue;
 			}
 
-			let event_id = services
+			if !redaction_allowed(&services, room_id, event).await
+				|| !thread_root_exists(&services, room_id, event).await
+				|| is_duplicate_reaction(&services, room_id, event, &mut reactions).await
+			{
+				continue;
+			}
+
+			let event_id = match services
 				.timeline
 				.build_and_append_pdu_with(
 					build(event),
@@ -126,7 +150,15 @@ pub(crate) async fn batch_send_route(
 					&state_lock,
 					body.send_notification,
 				)
-				.await?;
+				.await
+			{
+				| Ok(event_id) => event_id,
+				| Err(e) if is_too_large(&e) => {
+					warn!(%room_id, sender = %event.sender, "Skipping event too large to send: {e}");
+					continue;
+				},
+				| Err(e) => return Err(e),
+			};
 
 			written.insert(event_id.clone());
 			event_ids.push(event_id);
@@ -141,10 +173,22 @@ pub(crate) async fn batch_send_route(
 				continue;
 			}
 
-			let event_id = services
+			if is_duplicate_reaction(&services, room_id, event, &mut reactions).await {
+				continue;
+			}
+
+			let event_id = match services
 				.timeline
 				.build_and_prepend_pdu(build(event), &event.sender, room_id, &state_lock)
-				.await?;
+				.await
+			{
+				| Ok(event_id) => event_id,
+				| Err(e) if is_too_large(&e) => {
+					warn!(%room_id, sender = %event.sender, "Skipping event too large to send: {e}");
+					continue;
+				},
+				| Err(e) => return Err(e),
+			};
 
 			written.insert(event_id.clone());
 			event_ids.push(event_id);
@@ -160,7 +204,8 @@ pub(crate) async fn batch_send_route(
 	if forward
 		&& let Some(user_id) = &body.mark_read_by
 		&& let Some(last_event_id) = event_ids.last()
-		&& let Err(e) = mark_read(&services, room_id, user_id, last_event_id).await
+		&& let Err(e) =
+			mark_read(&services, appservice_info, room_id, user_id, last_event_id).await
 	{
 		warn!(%room_id, %user_id, "Failed to mark batch as read: {e}");
 	}
@@ -195,6 +240,92 @@ async fn existing_event_id(
 	}
 }
 
+async fn redaction_allowed(
+	services: &Services,
+	room_id: &RoomId,
+	event: &batch_send::BatchSendEvent,
+) -> bool {
+	if event.event_type != TimelineEventType::RoomRedaction {
+		return true;
+	}
+
+	let Some(redacts) = serde_json::from_str::<RoomRedactionEventContent>(event.content.get())
+		.ok()
+		.and_then(|content| content.redacts)
+	else {
+		return true;
+	};
+
+	let allowed = services
+		.state_accessor
+		.user_can_redact(&redacts, &event.sender, room_id, false)
+		.await
+		.unwrap_or(false);
+
+	if !allowed {
+		warn!(%room_id, sender = %event.sender, %redacts, "Skipping redaction the sender may not perform.");
+	}
+
+	allowed
+}
+
+async fn thread_root_exists(
+	services: &Services,
+	room_id: &RoomId,
+	event: &batch_send::BatchSendEvent,
+) -> bool {
+	let Ok(ExtractRelatesTo { relates_to: Relation::Thread(thread) }) =
+		serde_json::from_str(event.content.get())
+	else {
+		return true;
+	};
+
+	if services
+		.timeline
+		.get_pdu_id(&thread.event_id)
+		.await
+		.is_ok()
+	{
+		return true;
+	}
+
+	warn!(%room_id, sender = %event.sender, root = %thread.event_id, "Skipping thread message whose root is missing.");
+
+	false
+}
+
+async fn is_duplicate_reaction(
+	services: &Services,
+	room_id: &RoomId,
+	event: &batch_send::BatchSendEvent,
+	reactions: &mut HashSet<(OwnedUserId, OwnedEventId, String)>,
+) -> bool {
+	if event.event_type != TimelineEventType::Reaction {
+		return false;
+	}
+
+	let Ok(content) = serde_json::from_str::<ReactionEventContent>(event.content.get()) else {
+		return false;
+	};
+
+	let target = content.relates_to.event_id;
+	let key = content.relates_to.key;
+
+	let duplicate = !reactions.insert((event.sender.clone(), target.clone(), key.clone()))
+		|| services
+			.pdu_metadata
+			.event_has_relation(&target, Some(&event.sender), None, Some(&key))
+			.await;
+
+	if duplicate {
+		warn!(%room_id, sender = %event.sender, %target, %key, "Skipping duplicate reaction.");
+	}
+
+	duplicate
+}
+
+fn is_too_large(error: &Error) -> bool { matches!(error.kind(), ErrorKind::TooLarge) }
+
 async fn has_remote_servers(services: &Services, room_id: &RoomId) -> bool {
 	services
 		.state_cache
@@ -206,14 +337,20 @@ async fn has_remote_servers(services: &Services, room_id: &RoomId) -> bool {
 		.await
 }
 
-/// Whether the room contains any non-state events.
-async fn has_messages(services: &Services, room_id: &RoomId) -> bool {
+/// Whether the room contains any non-state events, other than ones written by
+/// an earlier attempt at this batch.
+async fn has_messages(
+	services: &Services,
+	room_id: &RoomId,
+	batch_ids: &HashSet<&EventId>,
+) -> bool {
 	let pdus = services.timeline.pdus_rev(None, room_id, None);
 	pin_mut!(pdus);
 
 	while let Some(item) = pdus.next().await {
 		if let Ok((_, pdu)) = item
 			&& pdu.state_key.is_none()
+			&& !from_batch(&pdu, batch_ids)
 		{
 			return true;
 		}
@@ -222,12 +359,43 @@ async fn has_messages(services: &Services, room_id: &RoomId) -> bool {
 	false
 }
 
+fn from_batch(pdu: &PduEvent, batch_ids: &HashSet<&EventId>) -> bool {
+	batch_ids.contains(pdu.event_id())
+		|| pdu
+			.get_content::<ExtractRelatesTo>()
+			.is_ok_and(|content| match content.relates_to {
+				| Relation::Annotation(annotation) => batch_ids.contains(&*annotation.event_id),
+				| _ => false,
+			})
+}
+
 async fn mark_read(
 	services: &Services,
+	appservice_info: &RegistrationInfo,
 	room_id: &RoomId,
 	user_id: &UserId,
 	event_id: &EventId,
 ) -> Result {
+	if !services.globals.user_is_local(user_id) {
+		return Err!(Request(InvalidParam("mark_read_by must be a local user.")));
+	}
+
+	if !services
+		.appservice
+		.can_act_as_user(appservice_info, user_id)
+		.await
+	{
+		return Err!(Request(Exclusive("mark_read_by is not in the appservice's namespace.")));
+	}
+
+	if !services
+		.state_cache
+		.is_joined(user_id, room_id)
+		.await
+	{
+		return Err!(Request(Forbidden("mark_read_by is not joined to the room.")));
+	}
+
 	let fully_read_event = FullyReadEvent {
 		content: FullyReadEventContent { event_id: event_id.to_owned() },
 	};

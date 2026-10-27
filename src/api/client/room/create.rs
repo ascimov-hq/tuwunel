@@ -1214,6 +1214,7 @@ impl From<InitialEvent> for PduBuilder {
 			redacts: None,
 			timestamp: None,
 			event_id_override: None,
+			assume_sender_joined: false,
 		}
 	}
 }

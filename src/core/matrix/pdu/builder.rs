@@ -54,6 +54,11 @@ pub struct Builder {
 	/// appservice batch sending into rooms that don't federate.
 	#[serde(skip)]
 	pub event_id_override: Option<OwnedEventId>,
+
+	/// Authorize the event as if the sender were joined to the room, ignoring the
+	/// room's power levels.
+	#[serde(skip)]
+	pub assume_sender_joined: bool,
 }
 
 impl Default for Builder {
@@ -66,6 +71,7 @@ impl Default for Builder {
 			redacts: None,
 			timestamp: None,
 			event_id_override: None,
+			assume_sender_joined: false,
 		}
 	}
 }
@@ -137,6 +143,10 @@ impl fmt::Debug for Builder {
 
 		if let Some(event_id) = self.event_id_override.as_ref() {
 			d.field("event_id", event_id);
+		}
+
+		if self.assume_sender_joined {
+			d.field("assume_sender_joined", &true);
 		}
 
 		if let Some(unsigned) = self.unsigned.as_ref() {

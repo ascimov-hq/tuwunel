@@ -10,7 +10,13 @@ use futures::{StreamExt, TryStreamExt};
 use ruma::{
 	CanonicalJsonObject, CanonicalJsonValue, MilliSecondsSinceUnixEpoch, OwnedEventId,
 	OwnedRoomId, RoomId, RoomVersionId, UserId,
-	events::{TimelineEventType, room::create::RoomCreateEventContent},
+	events::{
+		StateEventType, TimelineEventType,
+		room::{
+			create::RoomCreateEventContent,
+			member::{MembershipState, RoomMemberEventContent},
+		},
+	},
 	room_version_rules::RoomIdFormatVersion,
 	uint,
 };
@@ -29,7 +35,7 @@ use tuwunel_core::{
 };
 
 use super::RoomMutexGuard;
-use crate::rooms::state_res::auth_check;
+use crate::rooms::state_res::{StateMap, auth_check};
 
 /// Builds a canonical signed PDU and its structured representation.
 ///
@@ -54,6 +60,7 @@ pub async fn create_hash_and_sign_event(
 		redacts,
 		timestamp,
 		event_id_override,
+		assume_sender_joined,
 	} = pdu_builder;
 
 	let prev_events = self
@@ -160,6 +167,12 @@ pub async fn create_hash_and_sign_event(
 			.collect(),
 	};
 
+	let auth_events = if assume_sender_joined {
+		with_sender_joined(auth_events, &pdu)
+	} else {
+		auth_events
+	};
+
 	auth_check(&version_rules, &pdu, self, &auth_events)
 		.await?
 		.into_result()?;
@@ -191,6 +204,41 @@ pub async fn create_hash_and_sign_event(
 	check_rules(&pdu_json, &version_rules.event_format)?;
 
 	Ok((pdu, pdu_json))
+}
+
+fn with_sender_joined(mut auth_events: StateMap<PduEvent>, pdu: &PduEvent) -> StateMap<PduEvent> {
+	auth_events.remove(&(StateEventType::RoomPowerLevels, "".into()));
+
+	let key = (StateEventType::RoomMember, pdu.sender.as_str().into());
+	let joined = auth_events.get(&key).is_some_and(|member| {
+		member
+			.get_content::<RoomMemberEventContent>()
+			.is_ok_and(|content| content.membership == MembershipState::Join)
+	});
+
+	if joined {
+		return auth_events;
+	}
+
+	let member = PduBuilder::state(
+		pdu.sender.as_str(),
+		&RoomMemberEventContent::new(MembershipState::Join),
+	);
+
+	auth_events.insert(key, PduEvent {
+		event_id: ruma::event_id!("$assumedsenderjoin").into(),
+		kind: member.event_type,
+		content: member.content,
+		state_key: member.state_key,
+		auth_events: Default::default(),
+		prev_events: Default::default(),
+		redacts: None,
+		unsigned: None,
+		hashes: EventHash::default(),
+		..pdu.clone()
+	});
+
+	auth_events
 }
 
 #[implement(super::Service)]
